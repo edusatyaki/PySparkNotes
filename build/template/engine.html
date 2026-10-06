@@ -1,0 +1,834 @@
+<script>(() => {
+  const $ = (id) => document.getElementById(id);
+  const app = $('app'), stage = $('stage'), viewport = $('viewport');
+  const slides = [...stage.querySelectorAll('.slide')];
+  const N = slides.length;
+  const narrow = () => window.matchMedia('(max-width: 820px)').matches;
+  let cur = 0;
+
+  // ── saved state (this browser only) ──
+  const KEY = 'pysparkdeck:v1';
+  let state = { marks: [], seen: [], mcq: {}, predict: false };
+  try { state = { ...state, ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch (e) { /* storage unavailable */ }
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ } };
+  // MCQ options were reordered (version 2) — answers saved against the old order no longer apply
+  if (state.v !== 2) { state.mcq = {}; state.v = 2; save(); }
+  // titles lost the word "Situation" — carry earlier marks, progress and answers over to the new titles
+  const renamed = (k) => k.replace(/\|(\d+A?\.\d+) Situation — /, '|$1 ');
+  state.marks = state.marks.map(renamed); state.seen = state.seen.map(renamed);
+  const marks = new Set(state.marks), seen = new Set(state.seen);
+
+  // A stable key per slide (chapter + title + occurrence) so marks survive rebuilds
+  const used = {};
+  slides.forEach((s) => {
+    const base = `${s.dataset.ch}|${s.getAttribute('aria-label')}`;
+    used[base] = (used[base] || 0) + 1;
+    s.dataset.key = used[base] > 1 ? `${base}#${used[base]}` : base;
+  });
+  const keyToIndex = new Map(slides.map((s, i) => [s.dataset.key, i]));
+
+  // ── page numbers per chapter ──
+  const group = [], counts = {}, chSlides = {};
+  for (let i = 0; i < N;) {
+    const ch = slides[i].dataset.ch;
+    let j = i;
+    while (j < N && slides[j].dataset.ch === ch) j++;
+    const name = ch === 'QR' ? 'Quick Reference' : ch ? `Chapter ${ch}` : (i === 0 ? 'Introduction' : 'Closing');
+    for (let k = i; k < j; k++) group[k] = { name, first: i, size: j - i };
+    if (ch) { counts[ch] = j - i; chSlides[ch] = slides.slice(i, j); }
+    i = j;
+  }
+
+  const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+  // ── toast ──
+  let toastT;
+  function toast(msg) {
+    const t = $('toast'); t.textContent = msg; t.hidden = false;
+    clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, 1800);
+  }
+
+  // ── scale the 1600 × 900 canvas to the window ──
+  function scale() {
+    if (narrow()) { stage.style.transform = ''; return; }
+    const k = Math.min((viewport.clientWidth - 24) / 1600, (viewport.clientHeight - 24) / 900);
+    stage.style.transform = `translate(-50%, -50%) scale(${k})`;
+  }
+  // Fixed type scale: nothing shrinks. If a slide ever overflows, let it scroll rather than hide content.
+  function fit(slide) {
+    const body = slide.querySelector('.body');
+    if (!body || narrow()) return;
+    body.classList.remove('scroll');
+    body.classList.toggle('scroll', body.scrollHeight > body.clientHeight);
+  }
+
+  // ── Mark for Revisit ──
+  function paintMark(s) {
+    const on = marks.has(s.dataset.key);
+    s.classList.toggle('marked', on);
+    const b = s.querySelector('.mark');
+    b.setAttribute('aria-pressed', String(on));
+    b.title = on ? 'Remove from revisit list (R)' : 'Mark this page for revisit (R)';
+    b.textContent = on ? 'Marked for revisit' : 'Mark for revisit';
+  }
+  slides.forEach((s) => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'mark';
+    s.appendChild(b);
+    paintMark(s);
+  });
+  function toggleMark(s = slides[cur]) {
+    const k = s.dataset.key;
+    if (marks.has(k)) marks.delete(k); else marks.add(k);
+    state.marks = [...marks]; save();
+    paintMark(s); paintRevisit(); paintMenu();
+    toast(marks.has(k) ? 'Marked for revisit' : 'Removed from revisit list');
+  }
+  const markedIndexes = () => [...marks].map((k) => keyToIndex.get(k)).filter((i) => i !== undefined).sort((a, b) => a - b);
+  function paintRevisit() {
+    const idx = markedIndexes();
+    $('rv-n').textContent = idx.length;
+    $('rv-list').innerHTML = idx.length ? idx.map((i) => {
+      const s = slides[i], g = group[i];
+      return `<div class="rv-item"><a href="#s${i + 1}" data-go="${i + 1}"><small>${g.name} · page ${i - g.first + 1} of ${g.size}</small><span>${esc(s.getAttribute('aria-label'))}</span></a>
+<button type="button" data-unmark="${i}">Unmark</button></div>`;
+    }).join('') : '<p class="rv-empty">Nothing marked yet. On any page, click <b>Mark for revisit</b> (or press <kbd>R</kbd>) and it will be listed here.</p>';
+  }
+  function nextMarked() {
+    const idx = markedIndexes();
+    if (!idx.length) { toast('No pages marked yet — press R to mark one'); return; }
+    show(idx.find((i) => i > cur) ?? idx[0]);
+  }
+
+  // ── Predict mode ──
+  function setPredict(on) {
+    state.predict = on; save();
+    app.classList.toggle('predict', on);
+    $('predict-btn').setAttribute('aria-pressed', String(on));
+    slides.forEach((s) => s.classList.remove('revealed'));
+  }
+
+  // ── MCQs: answer, remember, retry, score per chapter ──
+  function score(ch) {
+    const list = (chSlides[ch] || []).filter((s) => s.classList.contains('mcq'));
+    let done = 0, right = 0;
+    list.forEach((s) => {
+      const a = state.mcq[s.dataset.key];
+      if (a !== undefined) { done++; if (a === +s.querySelector('.mcq-grid').dataset.ans) right++; }
+    });
+    return { total: list.length, done, right };
+  }
+  function paintScores(ch) {
+    const sc = score(ch);
+    (chSlides[ch] || []).forEach((s) => {
+      const t = s.querySelector('.tag.score');
+      if (!t) return;
+      t.hidden = !sc.done;
+      t.textContent = `Your score: ${sc.right} / ${sc.done} answered · ${sc.total} in this chapter`;
+    });
+  }
+  function answer(slide, i, { silent = false, quiet = false } = {}) {
+    const grid = slide.querySelector('.mcq-grid');
+    if (!grid || grid.classList.contains('answered')) return;
+    const ans = +grid.dataset.ans;
+    const opts = [...grid.querySelectorAll('.opt')];
+    grid.classList.add('answered');
+    opts[ans].classList.add('right');
+    const v = grid.querySelector('.verdict');
+    if (i === null) { v.textContent = `Answer: ${'ABCD'[ans]}`; v.className = 'verdict ok'; }
+    else if (i === ans) {
+      v.textContent = 'Correct'; v.className = 'verdict ok';
+      if (!silent && !quiet) { const r = opts[ans].getBoundingClientRect(); confetti({ x: r.left + r.width / 2, y: r.top + r.height / 2 }); }
+    }
+    else { opts[i].classList.add('wrong'); v.textContent = `Not quite — the answer is ${'ABCD'[ans]}`; v.className = 'verdict no'; }
+    v.insertAdjacentHTML('beforeend', '<button type="button" class="retry">Try again</button>');
+    grid.querySelector('.reveal').hidden = false;
+    if (!silent && i !== null) { state.mcq[slide.dataset.key] = i; save(); }
+    paintScores(slide.dataset.ch);
+    if (!silent && !quiet) { paintMenu(); fit(slide); }
+  }
+  function retry(slide) {
+    const grid = slide.querySelector('.mcq-grid');
+    grid.classList.remove('answered');
+    grid.querySelectorAll('.opt').forEach((o) => o.classList.remove('right', 'wrong'));
+    grid.querySelector('.reveal').hidden = true;
+    delete state.mcq[slide.dataset.key]; save();
+    paintScores(slide.dataset.ch); paintMenu();
+    fit(slide);
+  }
+  // restore earlier answers
+  slides.forEach((s) => {
+    const a = state.mcq[s.dataset.key];
+    if (a !== undefined && s.classList.contains('mcq')) answer(s, a, { silent: true });
+  });
+
+  function paintOpener(s) {
+    const box = s.querySelector('.op-progress');
+    if (!box) return;
+    const ch = s.dataset.ch, list = chSlides[ch] || [];
+    const pct = Math.round((list.filter((x) => seen.has(x.dataset.key)).length / list.length) * 100);
+    const sc = score(ch);
+    const nm = list.filter((x) => marks.has(x.dataset.key)).length;
+    box.querySelector('span').textContent = `Your progress: ${pct}% seen` + (sc.total ? ` · MCQs ${sc.right}/${sc.total} correct` : '') + (nm ? ` · ${nm} marked for revisit` : '');
+    box.querySelector('i').style.width = `${pct}%`;
+  }
+
+  // ── navigation ──
+  // ── paper page turn ──
+  // A real fold, not a tilt: the turning page's corner C travels to a point P, the crease is the
+  // perpendicular bisector of C→P, the page is clipped along that crease, and the part beyond it is
+  // reflected over as the plain back of the paper (an SVG polygon), with a soft shadow thrown onto
+  // the page underneath. The same renderer drives clicks, keys, the hover peek and dragging a corner.
+  const PW = 1600, PH = 900, C0 = { x: PW, y: PH };
+  stage.insertAdjacentHTML('beforeend', `<svg id="curl" viewBox="0 0 ${PW} ${PH}" aria-hidden="true">
+<defs>
+<linearGradient id="cg-sh" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0b1520" stop-opacity=".42"/><stop offset=".35" stop-color="#0b1520" stop-opacity=".12"/><stop offset="1" stop-color="#0b1520" stop-opacity="0"/></linearGradient>
+<linearGradient id="cg-in" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0b1520" stop-opacity=".16"/><stop offset="1" stop-color="#0b1520" stop-opacity="0"/></linearGradient>
+<linearGradient id="cg-fl" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#b9c3cf"/><stop offset=".08" stop-color="#e4e9ef"/><stop offset=".3" stop-color="#fbfcfd"/><stop offset=".55" stop-color="#ffffff"/><stop offset="1" stop-color="#d9e0e8"/></linearGradient>
+<filter id="cg-drop" filterUnits="userSpaceOnUse" x="-2000" y="-1000" width="5600" height="2900"><feDropShadow dx="0" dy="4" stdDeviation="9" flood-color="#0b1520" flood-opacity=".3"/></filter>
+</defs>
+<polygon id="c-sh" fill="url(#cg-sh)"/><polygon id="c-in" fill="url(#cg-in)"/><polygon id="c-fl" fill="url(#cg-fl)" filter="url(#cg-drop)"/>
+</svg>`);
+  const curlSvg = $('curl'), cSh = $('c-sh'), cIn = $('c-in'), cFl = $('c-fl');
+  const gSh = $('cg-sh'), gIn = $('cg-in'), gFl = $('cg-fl');
+  const RECT = [{ x: 0, y: 0 }, { x: PW, y: 0 }, { x: PW, y: PH }, { x: 0, y: PH }];
+  const pts = (a) => a.map((q) => `${q.x.toFixed(1)},${q.y.toFixed(1)}`).join(' ');
+  const setG = (g, a, b) => { g.setAttribute('x1', a.x); g.setAttribute('y1', a.y); g.setAttribute('x2', b.x); g.setAttribute('y2', b.y); };
+  function clipPoly(poly, f) {                // keep the part where f(point) >= 0
+    const out = [];
+    poly.forEach((A, k) => {
+      const B = poly[(k + 1) % poly.length], fa = f(A), fb = f(B);
+      if (fa >= 0) out.push(A);
+      if ((fa >= 0) !== (fb >= 0)) { const t = fa / (fa - fb); out.push({ x: A.x + (B.x - A.x) * t, y: A.y + (B.y - A.y) * t }); }
+    });
+    return out;
+  }
+  function constrain(P) {                     // paper cannot stretch: the corner stays within reach of the spine
+    let q = { x: P.x, y: Math.min(P.y, PH) };
+    let dx = q.x, dy = q.y - PH, l = Math.hypot(dx, dy);
+    if (l > PW) q = { x: dx / l * PW, y: PH + dy / l * PW };
+    const R = Math.hypot(PW, PH); l = Math.hypot(q.x, q.y);
+    if (l > R) q = { x: q.x / l * R, y: q.y / l * R };
+    return q;
+  }
+  let G = null;                               // the turn in progress: { T, U, P, raf, dir }
+  function render(P) {
+    G.P = P;
+    const dx = P.x - C0.x, dy = P.y - C0.y, L = Math.hypot(dx, dy);
+    if (L < 1) { G.T.style.clipPath = ''; curlSvg.style.visibility = 'hidden'; return; }
+    curlSvg.style.visibility = 'visible';
+    const n = { x: dx / L, y: dy / L }, M = { x: (P.x + C0.x) / 2, y: (P.y + C0.y) / 2 };
+    const side = (X) => (X.x - M.x) * n.x + (X.y - M.y) * n.y;
+    const keep = clipPoly(RECT, side), gone = clipPoly(RECT, (X) => -side(X));
+    const flap = gone.map((X) => { const d = side(X); return { x: X.x - 2 * d * n.x, y: X.y - 2 * d * n.y }; });
+    G.T.style.clipPath = keep.length > 2 ? `polygon(${keep.map((q) => `${q.x.toFixed(1)}px ${q.y.toFixed(1)}px`).join(',')})` : 'polygon(0 0, 0 0, 0 0)';
+    cSh.setAttribute('points', pts(gone));
+    cFl.setAttribute('points', pts(flap));
+    cIn.setAttribute('points', pts(keep));
+    const depth = Math.max(40, Math.max(0, ...flap.map(side)));
+    const shLen = Math.min(260, 60 + L * 0.35);
+    setG(gSh, M, { x: M.x - n.x * shLen, y: M.y - n.y * shLen });
+    setG(gFl, M, { x: M.x + n.x * depth, y: M.y + n.y * depth });
+    setG(gIn, { x: M.x + n.x * depth, y: M.y + n.y * depth }, { x: M.x + n.x * (depth + 120), y: M.y + n.y * (depth + 120) });
+  }
+  // t = 0: flat on the right page; t = 1: turned fully over the spine. The corner rises as it travels.
+  const pathP = (t) => constrain({ x: PW - 2 * PW * t, y: PH - PH * 0.3 * Math.sin(Math.PI * t) });
+  function begin(T, U) {
+    endTurn();
+    G = { T, U, P: C0, raf: 0 };
+    T.classList.add('pg-top'); U.classList.add('pg-under');
+    stage.classList.add('turning');
+  }
+  function endTurn() {
+    if (!G) return;
+    cancelAnimationFrame(G.raf);
+    G.T.style.clipPath = '';
+    G.T.classList.remove('pg-top'); G.U.classList.remove('pg-under');
+    curlSvg.style.visibility = 'hidden';
+    stage.classList.remove('turning');
+    G = null;
+  }
+  const ease = (x) => (x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2);
+  function run(fromT, toT, ms, done) {        // follow the natural path between two t values
+    const g = G, t0 = performance.now();
+    cancelAnimationFrame(g.raf);
+    const step = (now) => {
+      if (G !== g) return;
+      const k = Math.min(1, (now - t0) / ms);
+      render(pathP(fromT + (toT - fromT) * ease(k)));
+      if (k < 1) g.raf = requestAnimationFrame(step); else done && done();
+    };
+    g.raf = requestAnimationFrame(step);
+  }
+  function runTo(target, ms, done) {          // glide from wherever the corner is now
+    const g = G, A = G.P, t0 = performance.now();
+    cancelAnimationFrame(g.raf);
+    const step = (now) => {
+      if (G !== g) return;
+      const k = Math.min(1, (now - t0) / ms), e = ease(k);
+      render(constrain({ x: A.x + (target.x - A.x) * e, y: A.y + (target.y - A.y) * e }));
+      if (k < 1) g.raf = requestAnimationFrame(step); else done && done();
+    };
+    g.raf = requestAnimationFrame(step);
+  }
+  const motionOK = () => !narrow() && !matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let turnT = 0;
+  function finishTurn() {
+    clearTimeout(turnT);
+    endTurn();
+    document.querySelectorAll('.slide.leave, .slide.turn-in')
+      .forEach((e) => e.classList.remove('leave', 'turn-in', 'fwd'));
+  }
+  // ── home page ──
+  const home = $('home');
+  const atHome = () => !home.hidden;
+  function paintHome() {
+    const total = {}, done = {};
+    slides.forEach((s) => { const c = s.dataset.ch; if (!c) return; total[c] = (total[c] || 0) + 1; if (seen.has(s.dataset.key)) done[c] = (done[c] || 0) + 1; });
+    home.querySelectorAll('.hc').forEach((card) => {
+      const c = card.dataset.ch, pc = Math.round(100 * (done[c] || 0) / (total[c] || 1));
+      card.querySelector('.hc-bar i').style.width = `${pc}%`;
+      card.querySelector('.hc-p').textContent = pc === 0 ? 'Not started' : pc >= 100 ? 'All pages read' : `${pc}% read`;
+    });
+    let last = 0; try { last = +localStorage.getItem('pyspark-deck-slide') || 0; } catch (e) { /* storage unavailable */ }
+    const cont = home.querySelector('[data-home="continue"]');
+    cont.textContent = last > 1 ? `Continue — page ${last}` : 'Start reading';
+    cont.dataset.n = String(last > 1 ? last : 1);
+    home.querySelector('.h-rv').textContent = String(marks.size);
+  }
+  function openHome() {
+    closePanels(); if (rfOpen()) rfClose(); finishTurn();
+    paintHome(); home.hidden = false; app.classList.add('at-home'); home.scrollTop = 0;
+    history.replaceState(null, '', '#home');
+    termStart();
+  }
+  function leaveHome() { home.hidden = true; app.classList.remove('at-home'); termStop(); }
+  // the terminal on the home page types real PySpark code from the notes and prints its real output
+  let termT = 0, termK = 0;
+  const KWS = /\b(from|import|as|def|return|lambda|for|in|True|False|None|and|or|not)\b/g;
+  const hl = (q) => esc(q).replace(/"[^"\n]*"?|'[^'\n]*'?/g, (m) => `<span class="s">${m}</span>`).replace(KWS, '<span class="k">$1</span>')
+    .replace(/\.([a-zA-Z_]+)\(/g, '.<span class="f">$1</span>(').replace(/\b(\d+)\b/g, '<span class="n">$1</span>');
+  function termStop() { clearTimeout(termT); }
+  function termStart() {
+    termStop();
+    const code = home.querySelector('.h-code'), out = home.querySelector('.h-out');
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const run = () => {
+      const d = HOME_DEMO[termK++ % HOME_DEMO.length];
+      out.textContent = ''; out.classList.remove('on');
+      if (still) { code.innerHTML = hl(d.q); out.textContent = d.out; out.classList.add('on'); return; }
+      let i = 0;
+      const type = () => {
+        code.innerHTML = `${hl(d.q.slice(0, i))}<span class="caret"></span>`;
+        if (i++ < d.q.length) termT = setTimeout(type, d.q[i - 1] === '\n' ? 140 : 24 + Math.random() * 40);
+        else termT = setTimeout(() => { code.innerHTML = hl(d.q); out.textContent = d.out; out.classList.add('on'); termT = setTimeout(run, 4200); }, 450);
+      };
+      type();
+    };
+    run();
+  }
+  home.addEventListener('click', (e) => {
+    const t = e.target instanceof Element ? e.target : null;
+    if (!t) return;
+    const go = t.closest('[data-go]');
+    if (go) { show(+go.dataset.go - 1); return; }
+    const b = t.closest('[data-home]');
+    if (!b) return;
+    const a = b.dataset.home;
+    if (a === 'continue') show(+b.dataset.n - 1);
+    else if (a === 'start') show(0);
+    else if (a === 'revisit') { show(cur); openPanel('revisit'); }
+    else if (a === 'rapid') { show(cur); startRapid('*'); }
+  });
+
+  function show(i, { push = true, turned = false } = {}) {
+    i = Math.max(0, Math.min(N - 1, i));
+    const back = i < cur;
+    const fromHome = atHome();
+    if (fromHome) { leaveHome(); turned = true; }
+    if (!turned) finishTurn();
+    const old = slides[cur];
+    old.classList.remove('active', 'back');
+    if (i !== cur && !turned && motionOK()) {
+      // forward: the current page turns away over the next; back: the previous page turns back over this one
+      const T = back ? slides[i] : old, U = back ? old : slides[i];
+      old.classList.add('leave');
+      begin(T, U);
+      run(back ? 1 : 0, back ? 0 : 1, 900, finishTurn);
+    } else if (i !== cur && !turned && narrow()) {
+      slides[i].classList.add('turn-in');
+      if (!back) slides[i].classList.add('fwd');
+      turnT = setTimeout(finishTurn, 620);
+    }
+    cur = i;
+    const s = slides[cur];
+    s.classList.toggle('back', back);
+    s.classList.add('active');
+    fit(s);
+    if (narrow()) viewport.scrollTop = 0;
+    const g = group[cur];
+    const cs = getComputedStyle(s);
+    ['--cc', '--cc-mid', '--cc-soft', '--cc-deep'].forEach((v) => app.style.setProperty(v, cs.getPropertyValue(v)));
+    $('w-ch').textContent = g.name;
+    $('w-t').textContent = s.getAttribute('aria-label');
+    $('count').textContent = `${cur - g.first + 1} / ${g.size}`;
+    $('count').setAttribute('aria-label', `${g.name}, page ${cur - g.first + 1} of ${g.size}`);
+    $('prog').firstElementChild.style.width = `${((cur - g.first + 1) / g.size) * 100}%`;
+    if (push) history.replaceState(null, '', `#s${cur + 1}`);
+    if (!seen.has(s.dataset.key)) { seen.add(s.dataset.key); state.seen = [...seen]; save(); }
+    try { localStorage.setItem('pyspark-deck-slide', String(cur + 1)); } catch (e) { /* storage unavailable */ }
+    if (s.classList.contains('opener')) paintOpener(s);
+    if (s.classList.contains('deck')) loadDeck(s);
+    markMenu();
+    stage.querySelectorAll('.curl').forEach((c) => { c.hidden = c.classList.contains('prev') ? cur === 0 : cur === N - 1; });
+  }
+  const next = () => show(cur + 1), prev = () => show(cur - 1);
+
+  // ── lecture decks: the embed address is assembled here, only when the slide opens ──
+  const DECK_HOST = atob(['aHR0cHM6Ly93d3cu', 'Y2FudmEuY29t', 'L2Rlc2lnbi8='].join(''));
+  function loadDeck(s) {
+    const box = s.querySelector('.deck-frame');
+    if (!box || box.dataset.loaded) return;
+    box.dataset.loaded = '1';
+    const f = document.createElement('iframe');
+    f.src = DECK_HOST + atob(box.dataset.k) + '/view?embed&hide_controls=1';
+    f.title = `Lecture deck — ${box.dataset.title}`;
+    f.allowFullscreen = true;
+    f.setAttribute('allow', 'fullscreen');
+    f.setAttribute('loading', 'eager');
+    f.addEventListener('load', () => box.classList.add('ready'));
+    box.appendChild(f);
+  }
+
+  // ── copy code ──
+  function copyCode(btn) {
+    const fig = btn.closest('.code');
+    const text = [...fig.querySelectorAll('.c')].map((c) => c.textContent).join('\n');
+    const done = (msg) => {
+      btn.textContent = msg; btn.classList.add('done');
+      clearTimeout(btn._t); btn._t = setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1800);
+    };
+    const fallback = () => {
+      const r = document.createRange(); r.selectNodeContents(fig.querySelector('.code-b'));
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      done(ok ? 'Copied' : 'Selected — press Ctrl+C');
+    };
+    try {
+      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => done('Copied'), fallback);
+      else fallback();
+    } catch (e) { fallback(); }
+  }
+
+  // ── reference data panel ──
+  function openRef(key) {
+    const [src, t] = key.split(':');
+    $('ref-title').textContent = `Reference data — ${t}`;
+    $('ref-body').innerHTML = `<figure class="out"><figcaption>${esc(t)}.show()</figcaption><pre>${esc(REFS[key] || '')}</pre></figure>`;
+    document.querySelectorAll('.panel').forEach((p) => { p.hidden = p.id !== 'ref'; });
+  }
+
+  // ── panels ──
+  const list = $('menu-list');
+  function openPanel(id) {
+    document.querySelectorAll('.panel').forEach((p) => { p.hidden = p.id !== id; });
+    if (id === 'revisit') paintRevisit();
+  }
+  function closePanels() {
+    document.querySelectorAll('.panel').forEach((p) => { p.hidden = true; });
+    $('find').value = ''; filter('');
+    if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  }
+  const anyOpen = () => [...document.querySelectorAll('.panel')].some((p) => !p.hidden);
+  function openMenu() {
+    openPanel('menu');
+    list.querySelectorAll('.mch:not(.decks)').forEach((m) => m.classList.toggle('open', m.classList.contains('here')));
+    list.querySelector('.here')?.scrollIntoView({ block: 'start' });
+    $('find').focus();
+  }
+
+  // ── clicks inside slides ──
+  stage.addEventListener('click', (e) => {
+    const t = e.target;
+    if (t.closest('.copy')) { copyCode(t.closest('.copy')); return; }
+    if (t.closest('[data-ref]')) { openRef(t.closest('[data-ref]').dataset.ref); return; }
+    if (t.closest('.mark')) { toggleMark(t.closest('.slide')); return; }
+    if (t.closest('.retry')) { retry(t.closest('.slide')); return; }
+    const opt = t.closest('.opt');
+    if (opt) { answer(opt.closest('.slide'), +opt.dataset.i); return; }
+    if (t.closest('.show')) { answer(t.closest('.slide'), null); return; }
+    if (app.classList.contains('predict') && t.closest('.body .out, .body .expl')) { t.closest('.slide').classList.add('revealed'); return; }
+    const act = t.closest('[data-act]');
+    if (act) {
+      if (act.dataset.act === 'start') show(cur + 1);
+      else if (act.dataset.act === 'menu') openMenu();
+      else if (act.dataset.act === 'revisit') openPanel('revisit');
+      else if (act.dataset.act === 'rapid') startRapid(act.dataset.ch || '*');
+      return;
+    }
+    const go = t.closest('a[href^="#s"]');
+    if (go) { e.preventDefault(); show(+go.getAttribute('href').slice(2) - 1); }
+  });
+
+  document.querySelectorAll('.panel').forEach((p) => p.addEventListener('click', (e) => {
+    if (e.target === p || e.target.closest('[data-close]')) { closePanels(); return; }
+    const un = e.target.closest('[data-unmark]');
+    if (un) { toggleMark(slides[+un.dataset.unmark]); return; }
+    const go = e.target.closest('[data-go]');
+    if (!go) return;
+    e.preventDefault();
+    const mch = go.closest('.mch');
+    if (go.tagName === 'BUTTON' && mch && !mch.classList.contains('open')) { mch.classList.add('open'); return; }
+    show(+go.dataset.go - 1); closePanels();
+  }));
+  let clearArmed = false;
+  $('rv-clear').addEventListener('click', (e) => {
+    if (!marks.size) return;
+    if (!clearArmed) {
+      clearArmed = true; e.target.textContent = 'Click again to clear all';
+      setTimeout(() => { clearArmed = false; e.target.textContent = 'Clear all marks'; }, 2500);
+      return;
+    }
+    marks.clear(); state.marks = []; save();
+    slides.forEach(paintMark); paintRevisit(); paintMenu();
+    clearArmed = false; e.target.textContent = 'Clear all marks'; toast('All marks cleared');
+  });
+  $('rv-next').addEventListener('click', () => { closePanels(); nextMarked(); });
+
+  // ── chapter menu ──
+  function paintMenu() {
+    const open = new Set([...list.querySelectorAll('.mch.open')].map((m) => m.dataset.n));
+    const decks = slides.filter((x) => x.classList.contains('deck'));
+    const deckList = decks.length ? `<div class="mch decks open"><button type="button" data-go="${slides.indexOf(decks[0]) + 1}"><b>—</b><span>Lecture decks<em class="pages"><span>${decks.length} decks</span></em></span></button>
+<ul>${decks.map((x) => `<li><a href="#s${slides.indexOf(x) + 1}" data-go="${slides.indexOf(x) + 1}">${esc(x.getAttribute('aria-label').replace('Lecture deck — ', ''))}<i class="gap">${group[slides.indexOf(x)].name}</i></a></li>`).join('')}</ul></div>` : '';
+    list.innerHTML = deckList + MENU.map((c) => {
+      const ss = chSlides[c.key] || [];
+      const pct = ss.length ? Math.round((ss.filter((x) => seen.has(x.dataset.key)).length / ss.length) * 100) : 0;
+      const sc = score(c.key);
+      const nm = ss.filter((x) => marks.has(x.dataset.key)).length;
+      return `<div class="mch${open.has(String(c.n)) ? ' open' : ''}" data-n="${c.n}"><button type="button" data-go="${c.n}"><b>${c.key === 'QR' ? 'QR' : c.key}</b><span>${c.title}
+<em class="pages"><span>${counts[c.key]} pages</span><span><span class="seen"><i style="width:${pct}%"></i></span>${pct}% seen</span>${sc.total ? `<span>MCQs ${sc.right}/${sc.total}</span>` : ''}${nm ? `<span>${nm} marked</span>` : ''}</em></span></button>
+<ul>${c.items.map((it) => `<li><a href="#s${it.n}" data-go="${it.n}">${it.t}${it.k === 'gap' ? '<i class="gap">deep dive</i>' : it.k === 'deck' ? '<i class="gap">deck</i>' : it.k === 'practice' ? '<i class="practice">practice</i>' : ''}${marks.has(slides[it.n - 1]?.dataset.key) ? '<i class="mk">marked</i>' : ''}</a></li>`).join('')}</ul></div>`;
+    }).join('');
+    markMenu();
+  }
+  function markMenu() {
+    const n = cur + 1;
+    let here = null;
+    list.querySelectorAll('.mch:not(.decks)').forEach((m) => { if (+m.dataset.n <= n) here = m; });
+    list.querySelectorAll('.mch:not(.decks)').forEach((m) => m.classList.toggle('here', m === here));
+    list.querySelectorAll('a.cur').forEach((a) => a.classList.remove('cur'));
+    let best = null;
+    here?.querySelectorAll('a').forEach((a) => { if (+a.dataset.go <= n) best = a; });
+    best?.classList.add('cur');
+  }
+  function filter(q) {
+    q = q.trim().toLowerCase();
+    list.querySelectorAll('.mch').forEach((m) => {
+      let any = false;
+      m.querySelectorAll('li').forEach((li) => { const hit = !q || li.textContent.toLowerCase().includes(q); li.hidden = !hit; any ||= hit && !!q; });
+      m.hidden = !!q && !any && !m.querySelector('button').textContent.toLowerCase().includes(q);
+      if (q) m.classList.toggle('open', any);
+    });
+  }
+  $('find').addEventListener('input', (e) => filter(e.target.value));
+
+  // ── bar buttons ──
+  $('menu-btn').addEventListener('click', openMenu);
+  $('revisit-btn').addEventListener('click', () => openPanel('revisit'));
+  $('predict-btn').addEventListener('click', () => {
+    setPredict(!state.predict);
+    toast(state.predict ? 'Predict mode on — click an output to reveal it' : 'Predict mode off');
+  });
+  $('help-btn').addEventListener('click', () => openPanel('help'));
+  $('next').addEventListener('click', next);
+  stage.insertAdjacentHTML('beforeend', '<button type="button" class="curl prev" aria-label="Turn back a page" title="Previous page"></button><button type="button" class="curl next" aria-label="Turn the page" title="Next page"></button>');
+  // corners: hover lifts the paper, drag turns it by hand, a click (or Enter) turns it all the way
+  stage.querySelectorAll('.curl').forEach((btn) => {
+    const fwd = btn.classList.contains('next');
+    const toStage = (e) => { const r = stage.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width * PW, y: (e.clientY - r.top) / r.height * PH }; };
+    const corner = (q) => (fwd ? constrain(q) : constrain({ x: 2 * q.x - PW, y: q.y }));
+    const pair = () => (fwd ? [slides[cur], slides[cur + 1]] : [slides[cur - 1], slides[cur]]);
+    const flat = () => (fwd ? C0 : pathP(1));
+    let drag = null;
+    const arm = () => {
+      if (!motionOK() || (fwd ? cur >= N - 1 : cur <= 0) || (G && (!G.dir || G.committed))) return false;
+      if (!G || G.dir !== (fwd ? 'next' : 'prev')) {
+        const [T, U] = pair();
+        begin(T, U); G.dir = fwd ? 'next' : 'prev'; G.P = flat();
+        U.classList.add('leave');
+      }
+      return true;
+    };
+    const disarm = () => { if (G && G.dir && !G.committed) { const U = G.U; runTo(flat(), 260, () => { endTurn(); if (U !== slides[cur]) U.classList.remove('leave'); }); } };
+    btn.addEventListener('pointerenter', (e) => {
+      if (drag || e.pointerType === 'touch' || !arm()) return;
+      runTo(fwd ? { x: PW - 120, y: PH - 70 } : pathP(0.9), 260);
+    });
+    btn.addEventListener('pointerleave', () => { if (!drag) disarm(); });
+    btn.addEventListener('pointerdown', (e) => {
+      if (!arm()) return;
+      e.preventDefault();
+      btn.setPointerCapture(e.pointerId);
+      cancelAnimationFrame(G.raf);
+      drag = { x: e.clientX, y: e.clientY, moved: false };
+    });
+    btn.addEventListener('pointermove', (e) => {
+      if (!drag || !G) return;
+      if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 4) drag.moved = true;
+      if (drag.moved) render(corner(toStage(e)));
+    });
+    const release = (e) => {
+      if (!drag || !G) { drag = null; return; }
+      const d = drag; drag = null;
+      const q = toStage(e);
+      const go = !d.moved || (fwd ? q.x < PW * 0.55 : q.x > PW * 0.25);
+      if (!go) { disarm(); return; }
+      G.committed = true;
+      const target = fwd ? pathP(1) : C0;
+      runTo(target, d.moved ? 380 : 700, () => {
+        const U = G && G.U;
+        endTurn();
+        if (U) U.classList.remove('leave');
+        show(fwd ? cur + 1 : cur - 1, { turned: true });
+      });
+    };
+    btn.addEventListener('pointerup', release);
+    btn.addEventListener('pointercancel', () => { drag = null; disarm(); });
+    btn.addEventListener('click', (e) => { if (e.detail === 0) (fwd ? next : prev)(); });
+  });
+  $('prev').addEventListener('click', prev);
+  $('fs').addEventListener('click', toggleFs);
+  function toggleFs() {
+    try {
+      if (document.fullscreenElement) document.exitFullscreen?.();
+      else document.documentElement.requestFullscreen?.().catch(() => {});
+    } catch (e) { /* full screen not available here */ }
+  }
+
+  // ── keyboard ──
+  document.addEventListener('keydown', (e) => {
+    if (atHome()) {
+      if (anyOpen()) { if (e.key === 'Escape') closePanels(); return; }
+      if (e.metaKey || e.ctrlKey || e.altKey || (e.target instanceof Element && e.target.closest('input, textarea, select'))) return;
+      if (e.key === 'ArrowRight' || (e.key === 'Enter' && !(e.target instanceof Element && e.target.closest('button, a')))) { e.preventDefault(); home.querySelector('[data-home="continue"]').click(); }
+      return;
+    }
+    if (rfOpen()) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key;
+      if (anyOpen()) { if (k === 'Escape') closePanels(); return; }
+      if (k === 'Escape') rfClose();
+      else if (/^[a-dA-D1-4]$/.test(k) && rf.querySelector('[data-rf-i]')) rfResolve(/\d/.test(k) ? +k - 1 : 'abcd'.indexOf(k.toLowerCase()));
+      else if (['Enter', 'ArrowRight', ' '].includes(k)) { e.preventDefault(); rfNext(); }
+      return;
+    }
+    if (anyOpen()) { if (e.key === 'Escape') closePanels(); return; }
+    if (e.target instanceof Element && e.target.closest('input, textarea, select')) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const k = e.key;
+    if (['ArrowRight', 'PageDown', ' '].includes(k)) { e.preventDefault(); next(); }
+    else if (['ArrowLeft', 'PageUp'].includes(k)) { e.preventDefault(); prev(); }
+    else if (k === 'Home') openHome();
+    else if (k === 'End') show(N - 1);
+    else if (k === 'm' || k === 'M') { e.preventDefault(); openMenu(); }
+    else if (k === 'r' || k === 'R') toggleMark();
+    else if (k === 'v' || k === 'V') openPanel('revisit');
+    else if (k === 'n' || k === 'N') nextMarked();
+    else if (k === 'p' || k === 'P') $('predict-btn').click();
+    else if (k === 'q' || k === 'Q') $('rapid-btn').click();
+    else if (k === '?' || (e.code === 'Slash' && e.shiftKey) || k === 'h' || k === 'H') openPanel('help');
+    else if (k === 'f' || k === 'F') toggleFs();
+    else if (/^[a-dA-D1-4]$/.test(k) && slides[cur].classList.contains('mcq')) {
+      answer(slides[cur], /\d/.test(k) ? +k - 1 : 'abcd'.indexOf(k.toLowerCase()));
+    }
+  });
+
+  // ── swipe on touch screens (wide mode) ──
+  let x0 = null;
+  viewport.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; }, { passive: true });
+  viewport.addEventListener('touchend', (e) => {
+    if (x0 === null) return;
+    const dx = e.changedTouches[0].clientX - x0; x0 = null;
+    if (Math.abs(dx) > 60 && !narrow()) (dx < 0 ? next : prev)();
+  });
+
+  window.addEventListener('resize', () => { scale(); fit(slides[cur]); });
+  window.addEventListener('hashchange', () => {
+    if (location.hash === '#home') { if (!atHome()) openHome(); return; }
+    const m = location.hash.match(/^#s(\d+)$/); if (m) show(+m[1] - 1, { push: false });
+  });
+  $('home-btn').addEventListener('click', openHome);
+
+  // ── confetti (canvas, no library; off when the viewer prefers reduced motion) ──
+  const cv = $('confetti'), cx = cv.getContext('2d');
+  const calm = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const COLORS = ['#4a6a91', '#f0b43c', '#3fbf7f', '#e0704f', '#8fb6e4', '#b48ae0', '#ffffff'];
+  let bits = [], raf = 0;
+  function confetti({ x = innerWidth / 2, y = innerHeight / 2, count = 90, power = 1 } = {}) {
+    if (calm.matches) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== innerWidth * dpr) { cv.width = innerWidth * dpr; cv.height = innerHeight * dpr; cx.setTransform(dpr, 0, 0, dpr, 0, 0); }
+    for (let k = 0; k < count; k++) {
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 1.1;
+      const sp = (7 + Math.random() * 9) * power;
+      bits.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, w: 6 + Math.random() * 6, h: 9 + Math.random() * 8,
+        r: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.35, c: COLORS[k % COLORS.length], life: 0 });
+    }
+    if (!raf) raf = requestAnimationFrame(tick);
+  }
+  function tick() {
+    cx.clearRect(0, 0, innerWidth, innerHeight);
+    bits = bits.filter((b) => b.y < innerHeight + 40 && b.life < 260);
+    for (const b of bits) {
+      b.life++; b.vy += 0.32; b.vx *= 0.99; b.x += b.vx; b.y += b.vy; b.r += b.vr;
+      cx.save(); cx.translate(b.x, b.y); cx.rotate(b.r);
+      cx.globalAlpha = Math.max(0, 1 - b.life / 260); cx.fillStyle = b.c; cx.fillRect(-b.w / 2, -b.h / 2, b.w, b.h * Math.cos(b.life / 6));
+      cx.restore();
+    }
+    raf = bits.length ? requestAnimationFrame(tick) : (cx.clearRect(0, 0, innerWidth, innerHeight), 0);
+  }
+  const blast = () => { confetti({ x: innerWidth * 0.15, y: innerHeight, count: 140, power: 1.35 }); confetti({ x: innerWidth * 0.85, y: innerHeight, count: 140, power: 1.35 }); confetti({ x: innerWidth / 2, y: innerHeight * 0.6, count: 120, power: 1.1 }); };
+
+  // ── rapid fire ──
+  const rf = $('rf');
+  const RF = { qs: [], i: 0, score: 0, streak: 0, best: 0, right: 0, missed: [], t0: 0, timer: 0, locked: false, scope: '*', auto: 0 };
+  const rfOpen = () => !rf.hidden;
+  const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const k = Math.floor(Math.random() * (i + 1)); [a[i], a[k]] = [a[k], a[i]]; } return a; };
+  const scopeName = (ch) => (ch === '*' ? 'All chapters' : ch === '10' ? 'Chapter 10' : `Chapter ${ch}`);
+  function startRapid(ch, list) {
+    const pool = list || shuffle(slides.filter((s) => s.classList.contains('mcq') && (ch === '*' || s.dataset.ch === ch)));
+    if (!pool.length) { toast('This chapter has no MCQs — try another chapter'); return; }
+    Object.assign(RF, { qs: pool, i: 0, score: 0, streak: 0, best: 0, right: 0, missed: [], t0: performance.now(), locked: false, scope: ch });
+    closePanels();
+    rf.hidden = false;
+    rfQuestion();
+  }
+  function rfClose() { cancelAnimationFrame(RF.timer); clearTimeout(RF.auto); rf.hidden = true; rf.innerHTML = ''; }
+  function rfStats() {
+    return `<div class="rf-stats"><div class="rf-stat"><span>Question</span><b>${Math.min(RF.i + 1, RF.qs.length)} / ${RF.qs.length}</b></div>
+<div class="rf-stat"><span>Score</span><b>${RF.score}</b></div><div class="rf-stat streak${RF.streak >= 3 ? ' hot' : ''}"><span>Streak</span><b>${RF.streak}</b></div>
+<div class="rf-stat"><span>Correct</span><b>${RF.right}</b></div><div class="rf-stat clock"><span>Time left</span><b id="rf-clock">2:00</b></div></div>`;
+  }
+  function rfQuestion() {
+    const s = RF.qs[RF.i];
+    const grid = s.querySelector('.mcq-grid');
+    const code = s.querySelector('.mq .code');
+    const ref = s.querySelector('.mr .ref');
+    const opts = [...grid.querySelectorAll('.opt')].map((o, k) => `<button type="button" class="opt" data-rf-i="${k}"><b>${'ABCD'[k]}</b><span>${o.querySelector('span').innerHTML}</span></button>`).join('');
+    RF.locked = false;
+    RF.limit = 120;   // two minutes per question
+    rf.innerHTML = `<div class="rf-top"><span class="rf-title">Rapid fire · ${scopeName(RF.scope)}</span>${rfStats()}<button type="button" class="rf-x" data-rf="close">End quiz</button></div>
+<div class="rf-timer" aria-hidden="true"><i></i></div>
+${ref
+      ? `<div class="rf-q has-ref"><div>${s.querySelector('.mcq-top .tag').outerHTML}<p class="q">${s.querySelector('.mq .q').innerHTML}</p>${code ? code.outerHTML : ''}<div class="opts">${opts}</div><div class="rf-fb" hidden></div></div><div class="rf-r">${ref.outerHTML}</div></div>`
+      : `<div class="rf-q${code ? ' has-code' : ''}"><div>${s.querySelector('.mcq-top .tag').outerHTML}<p class="q">${s.querySelector('.mq .q').innerHTML}</p>${code ? code.outerHTML : ''}</div>
+<div><div class="opts">${opts}</div><div class="rf-fb" hidden></div></div></div>`}`;
+    const bar = rf.querySelector('.rf-timer i');
+    const t0 = performance.now();
+    const step = (now) => {
+      const left = Math.max(0, RF.limit - (now - t0) / 1000);
+      RF.left = left;
+      bar.style.transform = `scaleX(${left / RF.limit})`;
+      bar.classList.toggle('low', left < 15);
+      const clock = $('rf-clock');
+      if (clock) { const sec = Math.ceil(left); clock.textContent = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`; clock.parentElement.classList.toggle('low', left < 15); }
+      if (left <= 0) { rfResolve(null); return; }
+      RF.timer = requestAnimationFrame(step);
+    };
+    RF.timer = requestAnimationFrame(step);
+  }
+  function rfResolve(choice) {
+    if (RF.locked) return;
+    RF.locked = true;
+    cancelAnimationFrame(RF.timer);
+    const s = RF.qs[RF.i];
+    const ans = +s.querySelector('.mcq-grid').dataset.ans;
+    const btns = [...rf.querySelectorAll('.opt')];
+    btns[ans].classList.add('right');
+    rf.querySelector('.rf-q').classList.add('done');
+    const fb = rf.querySelector('.rf-fb');
+    const ok = choice === ans;
+    let html;
+    if (ok) {
+      const pts = 100 + Math.round(((RF.left || 0) / RF.limit) * 100) + (RF.streak >= 2 ? 50 : 0);
+      RF.score += pts; RF.right++; RF.streak++; RF.best = Math.max(RF.best, RF.streak);
+      html = `<p class="v ok">Correct · +${pts}${RF.streak >= 3 ? ` · streak ${RF.streak}` : ''}</p>`;
+      const r = btns[ans].getBoundingClientRect();
+      confetti({ x: r.left + r.width / 2, y: r.top + r.height / 2, count: RF.streak >= 3 ? 140 : 90 });
+    } else {
+      RF.streak = 0; RF.missed.push(s);
+      if (choice !== null) btns[choice].classList.add('wrong');
+      html = `<p class="v no">${choice === null ? 'Time’s up' : 'Not quite'} — the answer is ${'ABCD'[ans]}</p><p>${s.querySelector('.reveal .why').innerHTML}</p>`;
+    }
+    // record the answer on the MCQ slide too, so chapter scores stay in sync
+    if (choice !== null) {
+      const grid = s.querySelector('.mcq-grid');
+      if (grid.classList.contains('answered')) {
+        grid.classList.remove('answered'); grid.querySelectorAll('.opt').forEach((o) => o.classList.remove('right', 'wrong'));
+        grid.querySelector('.reveal').hidden = true;
+      }
+      answer(s, choice, { quiet: true });
+    }
+    const last = RF.i === RF.qs.length - 1;
+    fb.innerHTML = html + `<button type="button" class="rf-next" data-rf="next">${last ? 'See results →' : 'Next →'}</button>`;
+    fb.hidden = false;
+    rf.querySelector('.rf-stats').outerHTML = rfStats();
+    clearTimeout(RF.auto);
+    RF.auto = setTimeout(rfNext, ok ? 1300 : 6000);
+  }
+  function rfNext() {
+    clearTimeout(RF.auto);
+    if (!RF.locked) return;
+    RF.i++;
+    if (RF.i < RF.qs.length) rfQuestion(); else rfEnd();
+  }
+  function rfEnd() {
+    const n = RF.qs.length, pct = Math.round((RF.right / n) * 100);
+    const secs = Math.round((performance.now() - RF.t0) / 1000);
+    const grade = pct >= 90 ? 'Outstanding — you own this chapter.' : pct >= 70 ? 'Strong work. Review the few you missed.' : pct >= 50 ? 'Good start. Go through the missed questions, then play again.' : 'Revisit the chapter, then try again.';
+    rf.innerHTML = `<div class="rf-top"><span class="rf-title">Rapid fire · ${scopeName(RF.scope)}</span><button type="button" class="rf-x" data-rf="close" style="margin-left:auto">Close</button></div>
+<div class="rf-end"><h1>${RF.right} / ${n} correct</h1><p class="grade">${grade}</p>
+<div class="cards"><div><span>Score</span><b>${RF.score}</b></div><div><span>Accuracy</span><b>${pct}%</b></div><div><span>Best streak</span><b>${RF.best}</b></div><div><span>Time</span><b>${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}</b></div></div>
+<div class="acts"><button type="button" data-rf="again">Play again</button>${RF.missed.length ? `<button type="button" data-rf="wrong">Retry the ${RF.missed.length} you missed</button><button type="button" class="ghost" data-rf="markwrong">Mark missed for revisit</button>` : ''}<button type="button" class="ghost" data-rf="close">Back to the slides</button></div>
+${RF.missed.length ? `<div class="missed"><b style="color:#fff">Missed questions — open the slide:</b>${RF.missed.map((s) => `<a href="#s${slides.indexOf(s) + 1}" data-rf-go="${slides.indexOf(s)}">${esc(s.getAttribute('aria-label'))}</a>`).join('')}</div>` : ''}</div>`;
+    if (pct >= 70) blast();
+  }
+  rf.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const t = e.target;
+    if (t.closest('[data-ref]')) { openRef(t.closest('[data-ref]').dataset.ref); return; }
+    if (t.closest('.copy')) { copyCode(t.closest('.copy')); return; }
+    const o = t.closest('[data-rf-i]');
+    if (o) { rfResolve(+o.dataset.rfI); return; }
+    const goTo = t.closest('[data-rf-go]');
+    if (goTo) { e.preventDefault(); rfClose(); show(+goTo.dataset.rfGo); return; }
+    const act = t.closest('[data-rf]')?.dataset.rf;
+    if (act === 'close') rfClose();
+    else if (act === 'next') rfNext();
+    else if (act === 'again') startRapid(RF.scope);
+    else if (act === 'wrong') startRapid(RF.scope, shuffle([...RF.missed]));
+    else if (act === 'markwrong') {
+      RF.missed.forEach((s) => { marks.add(s.dataset.key); paintMark(s); });
+      state.marks = [...marks]; save(); paintRevisit(); paintMenu();
+      toast(`${RF.missed.length} ${RF.missed.length === 1 ? 'question' : 'questions'} marked for revisit`);
+    }
+  });
+  $('rapid-btn').addEventListener('click', () => { const ch = slides[cur].dataset.ch; startRapid(ch && ch !== 'QR' ? ch : '*'); });
+
+  // ── start ──
+  scale();
+  setPredict(!!state.predict);
+  slides.forEach((s) => s.classList.contains('mcq') && paintScores(s.dataset.ch));
+  paintRevisit();
+  paintMenu();
+  let start = 0;
+  const m = location.hash.match(/^#s(\d+)$/);
+  if (m) start = +m[1] - 1;
+  else { try { start = (+localStorage.getItem('pyspark-deck-slide') || 1) - 1; } catch (e) { start = 0; } }
+  slides[0].classList.add('active');
+  show(start, { push: !!m });
+  if (!m) openHome();
+})();
+</script>

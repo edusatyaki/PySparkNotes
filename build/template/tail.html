@@ -1,0 +1,36 @@
+<nav id="bar" aria-label="Slide navigation">
+<button type="button" id="home-btn" title="Home page (Home)">Home</button>
+<button type="button" id="menu-btn" aria-label="Open chapter menu" title="Chapters (M)">Chapters</button>
+<button type="button" id="revisit-btn" aria-label="Open revisit list" title="Revisit list (V)">Revisit <b id="rv-n">0</b></button>
+<button type="button" id="predict-btn" aria-pressed="false" title="Predict mode — hide outputs until clicked (P)">Predict</button>
+<button type="button" id="rapid-btn" title="Rapid fire quiz for this chapter (Q)">Rapid fire</button>
+<div id="where"><span id="w-ch"></span><span id="w-t"></span></div>
+<div id="prog" aria-hidden="true"><i></i></div>
+<button type="button" id="prev" aria-label="Previous slide" title="Previous (←)">‹</button>
+<span id="count" aria-live="polite"></span>
+<button type="button" id="next" aria-label="Next slide" title="Next (→)">›</button>
+<button type="button" id="help-btn" aria-label="Keyboard shortcuts" title="Shortcuts (?)">?</button>
+<button type="button" id="fs" aria-label="Full screen" title="Full screen (F)">Full screen</button>
+</nav>
+<div id="menu" class="panel" hidden><div class="panel-in" role="dialog" aria-label="Chapters">
+<div class="panel-h"><b>Chapters</b><input id="find" type="search" placeholder="Search slides…" aria-label="Search slides"><button type="button" class="x" data-close="menu" aria-label="Close">Close</button></div>
+<div id="menu-list" class="panel-list"></div></div></div>
+<div id="revisit" class="panel right" hidden><div class="panel-in" role="dialog" aria-label="Marked for revisit">
+<div class="panel-h"><b>Marked for revisit</b><button type="button" class="x" data-close="revisit" aria-label="Close">Close</button></div>
+<div id="rv-list" class="panel-list"></div>
+<div class="rv-foot"><button type="button" id="rv-next">Go to next marked slide</button><button type="button" id="rv-clear">Clear all marks</button></div></div></div>
+<div id="help" class="panel center" hidden><div class="panel-in" role="dialog" aria-label="Keyboard shortcuts">
+<div class="panel-h"><b>Keyboard shortcuts</b><button type="button" class="x" data-close="help" aria-label="Close">Close</button></div>
+<div class="keys-grid">
+<kbd>→ / Space</kbd><span>Next slide</span><kbd>←</kbd><span>Previous slide</span>
+<kbd>R</kbd><span>Mark or unmark this slide for revisit</span><kbd>V</kbd><span>Open the revisit list</span>
+<kbd>N</kbd><span>Jump to the next marked slide</span><kbd>P</kbd><span>Predict mode — outputs stay blurred until clicked</span>
+<kbd>A – D</kbd><span>Answer the MCQ on screen</span><kbd>M</kbd><span>Chapter menu and search</span>
+<kbd>F</kbd><span>Full screen</span><kbd>Home</kbd><span>Home page</span><kbd>End</kbd><span>Last slide</span>
+<kbd>Q</kbd><span>Rapid fire quiz for this chapter</span><kbd>? or H</kbd><span>This list of shortcuts</span><kbd>Esc</kbd><span>Close a panel</span>
+</div></div></div>
+<div id="ref" class="panel right" hidden><div class="panel-in wide" role="dialog" aria-label="Reference data">
+<div class="panel-h"><b id="ref-title">Reference data</b><button type="button" class="x" data-close="ref" aria-label="Close">Close</button></div>
+<div id="ref-body" class="panel-list"></div></div></div>
+<div id="toast" role="status" hidden></div>
+</div>
