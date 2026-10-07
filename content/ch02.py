@@ -1,6 +1,6 @@
 ORDER = 2
 KEY = '2'
-TITLE = 'DataFrame Basics: select, filter, withColumn, orderBy'
+TITLE = 'DataFrame Basics and spark.sql: select, filter, withColumn, orderBy'
 WEEK = 'Week 2'
 DATA = ['students']
 
@@ -169,6 +169,35 @@ people.show()''',
          expl='''Instead of a `StructType` you can write the schema as a **DDL string** — the same syntax as SQL `CREATE TABLE`. It is shorter and works in `createDataFrame`, `spark.read.schema(...)` and `from_json`.
 
 Python `None` becomes `NULL` in Spark.'''),
+
+    dict(divider=True, t='The same questions in SQL: spark.sql',
+         lead='Every query in this chapter can also be written as SQL. Register the DataFrame as a view once, then use whichever language reads better.'),
+
+    dict(t='2.16 Give the DataFrame a name SQL can use', tables=['students'],
+         code='''students.createOrReplaceTempView("students")
+
+spark.sql("""
+    SELECT name, branch, marks
+    FROM students
+    WHERE branch = 'CSE' AND marks > 85
+    ORDER BY marks DESC
+""").show()''',
+         expl='''`createOrReplaceTempView("students")` registers the DataFrame under a name for SQL — nothing is copied. `spark.sql(query)` returns an ordinary DataFrame, so `show()` runs it.
+
+This is the same query as `students.filter((F.col("branch") == "CSE") & (F.col("marks") > 85)).orderBy(F.desc("marks"))`, and it compiles to the **same plan**.'''),
+
+    dict(t='2.17 SQL in, DataFrame out — and back again', tables=['students'],
+         code='''toppers = spark.sql("SELECT * FROM students WHERE marks >= 85")
+
+report = (toppers.withColumn("grade", F.when(F.col("marks") >= 90, "A+").otherwise("A"))
+                 .select("name", "city", "marks", "grade")
+                 .orderBy("name"))
+report.createOrReplaceTempView("toppers_report")
+
+spark.sql("SELECT grade, COUNT(*) AS n FROM toppers_report GROUP BY grade ORDER BY grade").show()''',
+         expl='''Mix freely: start in SQL, continue with DataFrame methods, register the result as another view, and finish in SQL. Teams often write business rules in SQL and the plumbing (reading, writing, loops over dates) in Python.
+
+Chapter 9 goes deeper: CTEs, parameters, the catalog and permanent tables.'''),
 ]
 
 POINTS = '''
@@ -189,6 +218,7 @@ POINTS = '''
 5. `F.lit()` turns a Python constant into a column; `F.expr()` / `selectExpr` accept SQL text.
 6. `distinct()` compares whole rows; `dropDuplicates([cols])` keeps an arbitrary row per key.
 7. Give an **explicit schema** (StructType or DDL string) for real data.
+8. `df.createOrReplaceTempView("name")` + `spark.sql("SELECT …")` gives the same result and the same plan as the DataFrame API.
 '''
 
 EXTRA_TITLE = 'Deep dive: columns, types and ANSI mode'
@@ -216,7 +246,7 @@ Read the error class in brackets (`CAST_INVALID_INPUT`) — Spark 4 error messag
 | `StringType` | `str` | `STRING` | |
 | `BooleanType` | `bool` | `BOOLEAN` | |
 | `DateType` / `TimestampType` | `date` / `datetime` | `DATE` / `TIMESTAMP` | Timestamps follow the session time zone |
-| `ArrayType`, `MapType`, `StructType` | `list`, `dict`, `Row` | `ARRAY<…>`, `MAP<…>`, `STRUCT<…>` | Chapter 5 |'''),
+| `ArrayType`, `MapType`, `StructType` | `list`, `dict`, `Row` | `ARRAY<…>`, `MAP<…>`, `STRUCT<…>` | Chapter 8 |'''),
     dict(t='Why parentheses matter in filters', error=True,
          code='''students.filter(F.col("branch") == "CSE" & F.col("marks") > 80).show()''',
          expl='''Python evaluates `"CSE" & F.col("marks")` first, because `&` binds tighter than `==` and `>`. What is left, `a == b > 80`, is a Python **chained comparison**, which needs a True/False value from a Column — and PySpark refuses with `CANNOT_CONVERT_COLUMN_INTO_BOOL`.

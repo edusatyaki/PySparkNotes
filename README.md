@@ -4,10 +4,32 @@ A presentation-style website of PySpark class notes, from the first SparkSession
 
 ## What is inside
 
-- **14 chapters + a one-page SQL ↔ PySpark quick reference**, following the course syllabus: SparkSession and architecture, DataFrame basics, built-in functions, aggregations, complex types and JSON, joins, window functions, Spark SQL, reading and writing data, performance and internals, UDFs and pandas, Structured Streaming, MLlib, and production PySpark.
-- **192 sections**, each a question with the PySpark code, the **real output from Spark 4.2**, and an explanation. The DataFrame a query works on is shown beside it.
-- **44 deep-dive slides** on internals: plans, shuffles, broadcast vs sort-merge joins, AQE, skew, memory, Parquet pushdown and streaming state.
-- **114 MCQs**: concept questions, predict-the-output questions (run on Spark when the site is built), and debug-the-code questions.
+The chapters follow the course sequence:
+
+| # | Chapter |
+|---|---|
+| 0 | Spark theory — why Spark exists, how it runs, where it fits, medallion preview |
+| 1 | Getting started — SparkSession, partitions, lazy evaluation in code |
+| 2 | DataFrame basics + `spark.sql` |
+| 3 | Reading and writing basics — raw landing = **Bronze** |
+| 4 | Built-in functions — cleaning = **Silver** |
+| 5 | Aggregations — business tables = **Gold** |
+| 6 | Joins |
+| 7 | Window functions |
+| 8 | Complex types and JSON |
+| 9 | Spark SQL and the catalog |
+| 10 | Performance and internals |
+| 11 | UDFs and pandas |
+| 12 | Delta Lake + the medallion architecture — MERGE, SCD2, incremental loads, CDF, RESTORE |
+| 13 | Structured Streaming |
+| 14 | Production PySpark — structure, tests, data quality, idempotent writes |
+| 15 | Capstone: the ShopKart pipeline, Bronze → Silver → Gold on Delta |
+| 16 | MLlib (optional) |
+| 17 | Quick reference — the whole course on one page |
+
+- **245 sections**, each a question with the PySpark code, the **real output from Spark 4.2** (Delta Lake 4.4 for chapters 12 and 15), and an explanation. The DataFrame a query works on is shown beside it.
+- **40 deep-dive slides** on internals: plans, shuffles, joins, AQE, skew, memory, Parquet pushdown, streaming state.
+- **134 MCQs**: concept, predict-the-output (run on Spark at build time) and debug-the-code questions.
 - **Practice after every chapter**, with LeetCode problems to solve with the DataFrame API.
 
 It has the same interactive features as the PostgreSQL notes: home page with a live terminal, chapter menu with search, mark for revisit, predict mode (**P**), rapid-fire quiz (**Q**), confetti, per-chapter progress, paper page turn, and a scrollable reading view on phones.
@@ -23,7 +45,7 @@ build/template/        page shell, CSS and slide engine (shared design with Post
 build/outputs.json     the captured Spark outputs (committed, so rendering needs no Spark)
 ```
 
-Requirements: Java 17 and Python 3.13 with the packages in `requirements.txt`.
+Requirements: Java 17 and Python 3.13 with the packages in `requirements.txt`. The first run downloads the Delta Lake JARs from Maven Central.
 
 ```
 python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt

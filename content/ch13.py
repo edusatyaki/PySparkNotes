@@ -1,240 +1,249 @@
 ORDER = 13
 KEY = '13'
-TITLE = 'MLlib: features, pipelines, evaluation and tuning'
-WEEK = 'Week 7'
-DATA = ['customers (churn)']
+TITLE = 'Structured Streaming: files, windows, watermarks, foreachBatch'
+WEEK = 'Week 6'
+DATA = ['data/stream/in/*.json']
 
-SETUP_TITLE = '13.0 The data — will the customer leave?'
-SETUP = '''import random
+SETUP_TITLE = '13.0 A folder that receives new files'
+SETUP = '''import json, os, shutil
 from pyspark.sql import functions as F
-from pyspark.ml import Pipeline, PipelineModel
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler
-from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
-from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
 
-rng = random.Random(7)
-rows = []
-for i in range(1, 201):
-    contract = rng.choice(["Monthly", "Monthly", "Yearly", "TwoYear"])
-    tenure = rng.randint(1, 60)
-    charges = round(rng.uniform(300, 1500), 0)
-    calls = rng.randint(0, 6)
-    risk = (1.5 if contract == "Monthly" else -1.0) - tenure / 20 + calls / 2 + (charges - 900) / 600
-    churned = 1 if risk + rng.gauss(0, 0.8) > 0.5 else 0
-    rows.append((i, contract, tenure, float(charges), calls, churned))
+for d in ["data/stream"]:
+    shutil.rmtree(d, ignore_errors=True)
+os.makedirs("data/stream/in")
 
-customers = spark.createDataFrame(
-    rows, "cust_id INT, contract STRING, tenure INT, monthly_charges DOUBLE, support_calls INT, churned INT")
-customers.groupBy("churned").count().orderBy("churned").show()'''
-SETUP_EXPL = '''200 synthetic telecom customers. Churn is more likely with a monthly contract, short tenure, high charges and many support calls — plus random noise, so no model can be perfect.
+def drop_file(name, events):
+    """Simulate an upstream system writing one new JSON-lines file into the folder."""
+    tmp = f"data/stream/{name}.tmp"
+    with open(tmp, "w") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\\n")
+    os.rename(tmp, f"data/stream/in/{name}.json")   # appear atomically
 
-The generator uses a fixed seed, so every run of these notes produces exactly the same data. `pyspark.ml` is Spark's DataFrame-based machine-learning library (MLlib); models train in parallel across the cluster.'''
+drop_file("batch1", [
+    {"order_id": 1, "ts": "2026-03-01 10:00:05", "city": "Pune",   "amount": 500},
+    {"order_id": 2, "ts": "2026-03-01 10:03:40", "city": "Delhi",  "amount": 1200},
+    {"order_id": 3, "ts": "2026-03-01 10:07:10", "city": "Pune",   "amount": 300},
+    {"order_id": 4, "ts": "2026-03-01 10:12:00", "city": "Mumbai", "amount": 900},
+])
+
+schema = "order_id INT, ts TIMESTAMP, city STRING, amount INT"'''
+SETUP_EXPL = '''Structured Streaming treats a stream as a **table that keeps growing**: every new record is a new row, and your query is re-run incrementally on the new rows only.
+
+Here the stream source is a folder: each new JSON file is a new batch of orders. `drop_file` writes to a temporary name and renames it, because a file source must never see half-written files. The same code works with Kafka by changing only the `readStream` source.'''
 
 SECTIONS = [
-    dict(t='13.1 Estimators and transformers: StringIndexer', tables=['customers'],
-         code='''indexer = StringIndexer(inputCol="contract", outputCol="contract_idx")
-indexer_model = indexer.fit(customers)          # Estimator.fit → Transformer
-print(indexer_model.labels)
+    dict(t='13.1 Read a stream: readStream with a schema',
+         code='''orders = spark.readStream.schema(schema).json("data/stream/in")
 
-indexer_model.transform(customers).select("contract", "contract_idx").distinct().orderBy("contract_idx").show()''',
-         expl='''Two kinds of objects run all of MLlib. An **Estimator** learns from data with `fit()` and returns a model. A **Transformer** adds columns with `transform()`.
+print(orders.isStreaming)
+orders.printSchema()''',
+         expl='''`spark.readStream` returns a **streaming DataFrame**. Most of the DataFrame API — `select`, `filter`, `withColumn`, `groupBy`, joins — works on it unchanged.
 
-`StringIndexer` is an estimator: `fit` counts the categories and orders them by frequency (most common → 0.0); the fitted model then maps text to numbers.'''),
+A file stream **requires** a schema: Spark cannot infer one from data that has not arrived yet. Calling `show()` or `count()` directly on a streaming DataFrame is an error — results are produced by starting a query with `writeStream`.'''),
 
-    dict(t='13.2 One-hot encode the category', tables=['customers'],
-         code='''encoded = OneHotEncoder(inputCols=["contract_idx"], outputCols=["contract_vec"]) \\
-    .fit(indexer_model.transform(customers)) \\
-    .transform(indexer_model.transform(customers))
-encoded.select("contract", "contract_idx", "contract_vec").distinct().orderBy("contract_idx").show()''',
-         expl='''An index such as 0, 1, 2 would wrongly tell a linear model that TwoYear is "twice" Yearly. **One-hot encoding** turns it into a vector with a single 1. Spark prints it as a **sparse vector** `(size, [positions], [values])`.
+    dict(t='13.2 Start a query: writeStream, a sink, a trigger',
+         code='''big = orders.filter(F.col("amount") >= 500).select("order_id", "city", "amount")
 
-With 3 categories the vector has size **2**: the last category is dropped (`dropLast=True`) because it is implied when the others are 0.'''),
+q = (big.writeStream
+        .format("memory").queryName("big_orders")     # results go to an in-memory table
+        .outputMode("append")
+        .trigger(availableNow=True)                   # process what is there, then stop
+        .start())
+q.awaitTermination()
 
-    dict(t='13.3 Pack the features into one vector: VectorAssembler', tables=['customers'],
-         code='''assembler = VectorAssembler(
-    inputCols=["contract_vec", "tenure", "monthly_charges", "support_calls"],
-    outputCol="features")
+spark.sql("SELECT * FROM big_orders ORDER BY order_id").show()''',
+         expl='''`writeStream` needs a **sink** (`memory` here — for testing only; real sinks are files, Delta tables and Kafka), an **output mode** and a **trigger**.
 
-assembler.transform(encoded).select("features", "churned").show(4, truncate=False)''',
-         expl='''Every MLlib model expects **one column of type vector** holding all features, plus a label column. `VectorAssembler` concatenates numeric columns and vectors into that column — here 2 + 1 + 1 + 1 = 5 numbers per customer.'''),
+`availableNow=True` processes all data available now and stops — perfect for scheduled "incremental batch" jobs and for reproducible notes. Without a trigger the query runs forever, starting a micro-batch as soon as the previous one finishes.'''),
 
-    dict(t='13.4 The whole recipe as a Pipeline', tables=['customers'], home=True,
-         code='''lr = LogisticRegression(featuresCol="scaled", labelCol="churned")
+    dict(t='13.3 Process only the new files: checkpoints',
+         code='''def run_to_parquet():
+    q = (orders.writeStream.format("parquet")
+            .option("path", "data/stream/out/orders")
+            .option("checkpointLocation", "data/stream/chk/orders")
+            .trigger(availableNow=True).start())
+    q.awaitTermination()
+    return q.lastProgress["numInputRows"]
 
-pipeline = Pipeline(stages=[
-    StringIndexer(inputCol="contract", outputCol="contract_idx"),
-    OneHotEncoder(inputCols=["contract_idx"], outputCols=["contract_vec"]),
-    VectorAssembler(inputCols=["contract_vec", "tenure", "monthly_charges", "support_calls"],
-                    outputCol="features"),
-    StandardScaler(inputCol="features", outputCol="scaled"),
-    lr,
-])
-train, test = customers.randomSplit([0.75, 0.25], seed=42)
-print(train.count(), test.count())''',
-         expl='''A **Pipeline** chains the stages; `pipeline.fit(train)` fits each estimator in order on the training data only and returns a `PipelineModel` that replays every step on new data.
+print("run 1 read", run_to_parquet(), "rows")
+drop_file("batch2", [{"order_id": 5, "ts": "2026-03-01 10:31:00", "city": "Delhi", "amount": 700}])
+print("run 2 read", run_to_parquet(), "rows")
+print("run 3 read", run_to_parquet(), "rows")
+print("table now has", spark.read.parquet("data/stream/out/orders").count(), "rows")''',
+         expl='''The **checkpoint** folder records which files were already processed (and, for stateful queries, the running state). Run 1 reads the 4 orders of batch1. Run 2 reads **only** the new file. Run 3 finds nothing new.
 
-That is what prevents **data leakage**: the scaler's mean and standard deviation, and the indexer's categories, are learned from the training set alone. `randomSplit` with a seed gives a reproducible 75/25 split.'''),
+That is how a scheduled streaming job gets **exactly-once** results: restart it as often as you like, and each input file is processed once. Never share a checkpoint between two queries.'''),
 
-    dict(t='13.5 Fit and predict', tables=['customers'],
-         code='''from pyspark.ml.functions import vector_to_array
+    dict(t='13.4 A running aggregate: outputMode("complete")',
+         code='''per_city = orders.groupBy("city").agg(F.count("*").alias("orders"), F.sum("amount").alias("revenue"))
 
-model = pipeline.fit(train)
-pred = model.transform(test)
+q = (per_city.writeStream.format("memory").queryName("city_totals")
+        .outputMode("complete").trigger(availableNow=True).start())
+q.awaitTermination()
+spark.sql("SELECT * FROM city_totals ORDER BY city").show()''',
+         expl='''An aggregation keeps **state** — the running count and sum per city — between micro-batches. `complete` mode rewrites the whole result table after each batch.
 
-(pred.select("cust_id", "contract", "tenure", "support_calls", "churned", "prediction",
-             F.round(vector_to_array("probability")[1], 3).alias("p_churn"))
-     .orderBy("cust_id").show(8))''',
-         expl='''`pipeline.fit(train)` runs every stage in order and returns a `PipelineModel`; `transform(test)` adds `rawPrediction`, `probability` (a vector: [P(stay), P(churn)]) and `prediction` (0 or 1, using a 0.5 threshold).
+`append` is not allowed for an aggregation without a watermark, because a city's total can still change when new orders arrive; Spark would refuse to start the query.'''),
 
-`vector_to_array` turns the probability vector into an array so element 1, the churn probability, can be selected like any column.'''),
+    dict(t='13.5 Count per 10-minute window (event time)',
+         code='''windowed = (orders
+    .groupBy(F.window("ts", "10 minutes"), "city")
+    .agg(F.count("*").alias("orders")))
 
-    dict(t='13.6 How good is it? AUC and accuracy', tables=['customers'],
-         code='''auc = BinaryClassificationEvaluator(labelCol="churned", metricName="areaUnderROC").evaluate(pred)
-acc = MulticlassClassificationEvaluator(labelCol="churned", metricName="accuracy").evaluate(pred)
-print(f"AUC      = {auc:.3f}")
-print(f"accuracy = {acc:.3f}")
+q = (windowed.writeStream.format("memory").queryName("per_window")
+        .outputMode("complete").trigger(availableNow=True).start())
+q.awaitTermination()
+spark.sql("SELECT window.start, window.end, city, orders FROM per_window ORDER BY start, city").show()''',
+         expl='''`F.window(timeColumn, "10 minutes")` assigns each order to a 10-minute bucket by its **event time** — the `ts` inside the record — not by when Spark happened to read it. That keeps results correct when data arrives late or out of order.
 
-pred.groupBy("churned").pivot("prediction", [0.0, 1.0]).count().orderBy("churned").show()''',
-         expl='''**AUC** (area under the ROC curve) measures how well the predicted probabilities rank churners above non-churners: 0.5 is a coin toss, 1.0 is perfect. **Accuracy** is the share of correct 0/1 predictions.
+`window("ts", "10 minutes", "5 minutes")` would make **sliding** windows that overlap.'''),
 
-The pivot is a **confusion matrix**: rows are the true label, columns the prediction. Off-diagonal cells are the mistakes — false alarms and missed churners.'''),
+    dict(t='13.6 Late data and watermarks',
+         code='''late_orders = spark.readStream.schema(schema).json("data/stream/in")
+wm = (late_orders.withWatermark("ts", "10 minutes")
+        .groupBy(F.window("ts", "10 minutes")).agg(F.count("*").alias("orders")))
 
-    dict(t='13.7 What did the model learn? Coefficients', tables=['customers'],
-         code='''lr_model = model.stages[-1]
-names = ["contract=" + l for l in model.stages[0].labels[:-1]] + ["tenure", "monthly_charges", "support_calls"]
-for n, c in zip(names, lr_model.coefficients):
-    print(f"{n:20} {c:+.3f}")
-print(f"{'intercept':20} {lr_model.intercept:+.3f}")''',
-         expl='''`model.stages` holds the fitted stages; the last is the trained `LogisticRegressionModel`. Because the features were standardised, the coefficient sizes are comparable: positive = raises churn risk.
+def run_wm():
+    q = (wm.writeStream.format("parquet")
+           .option("path", "data/stream/out/wm").option("checkpointLocation", "data/stream/chk/wm")
+           .outputMode("append").trigger(availableNow=True).start())
+    q.awaitTermination()
+    return q.lastProgress["eventTime"].get("watermark")
 
-The signs match how the data was generated — short tenure (negative tenure coefficient), more support calls and a monthly contract push customers to leave.'''),
+print("watermark after run 1:", run_wm())
+drop_file("batch3", [{"order_id": 6, "ts": "2026-03-01 10:02:00", "city": "Pune", "amount": 450},   # 30 min late
+                     {"order_id": 7, "ts": "2026-03-01 10:45:00", "city": "Pune", "amount": 650}])
+print("watermark after run 2:", run_wm())
+spark.read.parquet("data/stream/out/wm").orderBy("window").show(truncate=False)''',
+         expl='''A **watermark** of 10 minutes says: "events more than 10 minutes older than the latest event seen can be ignored". After batch2 the latest event is 10:31, so the watermark is 10:21 — windows ending before it are **final**, written once in `append` mode, and their state is dropped.
 
-    dict(t='13.8 A different model: random forest and feature importances', tables=['customers'],
-         code='''rf_pipeline = Pipeline(stages=pipeline.getStages()[:-2] + [
-    RandomForestClassifier(featuresCol="features", labelCol="churned", numTrees=50, maxDepth=4, seed=42)])
-rf_model = rf_pipeline.fit(train)
-rf_pred = rf_model.transform(test)
+Order 6 (10:02) arrives after its window was finalised, so it is **not counted**: the 10:00–10:10 window still shows 3 orders. Without a watermark, Spark would have to keep every window's state forever.'''),
 
-print(f"RF AUC = {BinaryClassificationEvaluator(labelCol='churned').evaluate(rf_pred):.3f}")
-for n, imp in zip(names, rf_model.stages[-1].featureImportances.toArray()):
-    print(f"{n:20} {imp:.3f}")''',
-         expl='''Swapping the model means swapping one stage — the feature stages are reused. Trees need no scaling, so the scaler is left out. `featureImportances` shows how much each feature contributed to the forest's splits.
+    dict(t='13.7 Write each micro-batch with batch code: foreachBatch',
+         code='''def save_batch(batch_df, batch_id):
+    print(f"batch {batch_id}: {batch_df.count()} rows")
+    (batch_df.withColumn("batch_id", F.lit(batch_id))
+             .write.mode("append").parquet("data/stream/out/by_batch"))
 
-`seed=42` makes the forest reproducible; without it every run builds different trees.'''),
+one_file_each = (spark.readStream.schema(schema)
+                      .option("maxFilesPerTrigger", 1)        # a source option
+                      .json("data/stream/in"))
 
-    dict(t='13.9 Tune hyper-parameters: CrossValidator', tables=['customers'],
-         code='''from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+q = (one_file_each.writeStream.foreachBatch(save_batch)
+        .option("checkpointLocation", "data/stream/chk/by_batch")
+        .trigger(availableNow=True).start())
+q.awaitTermination()''',
+         expl='''`foreachBatch(func)` calls your function with each micro-batch as an ordinary **batch DataFrame** plus its batch ID. Inside, you can use any batch API: write to several sinks, MERGE into a Delta table, call an API, write to a JDBC database.
 
-grid = (ParamGridBuilder()
-        .addGrid(lr.regParam, [0.0, 0.1, 1.0])
-        .addGrid(lr.elasticNetParam, [0.0, 1.0])
-        .build())
-cv = CrossValidator(estimator=pipeline, estimatorParamMaps=grid,
-                    evaluator=BinaryClassificationEvaluator(labelCol="churned"),
-                    numFolds=3, seed=42, parallelism=2)
-cv_model = cv.fit(train)
+`maxFilesPerTrigger=1` — an option of the **source**, set on `readStream` — makes each file its own micro-batch, so the three files produced three batches (4, 1 and 2 orders). `availableNow` respects such limits and simply runs as many batches as needed. Use `batch_id` to make writes idempotent if a batch is retried.'''),
 
-for params, metric in zip(grid, cv_model.avgMetrics):
-    print({p.name: v for p, v in params.items()}, round(metric, 3))''',
-         expl='''`ParamGridBuilder` lists the combinations to try (3 × 2 = 6). `CrossValidator` fits every combination on 3 train/validation folds — 18 fits — and keeps the best by average AUC; `cv_model.bestModel` is refitted on all the training data.
+    dict(t='13.8 Enrich a stream with a static table (stream–static join)',
+         code='''cities = spark.createDataFrame([("Pune", "West"), ("Mumbai", "West"), ("Delhi", "North")],
+                               "city STRING, region STRING")
 
-Read the last line: strong L1 regularisation (`regParam=1.0`, `elasticNetParam=1.0`) pushed every coefficient to zero, so the model predicts the same probability for everyone — AUC 0.5, a coin toss. `parallelism=2` trains two candidate models at the same time.'''),
+enriched = orders.join(cities, "city", "left")
+q = (enriched.writeStream.format("memory").queryName("enriched")
+        .outputMode("append").trigger(availableNow=True).start())
+q.awaitTermination()
+spark.sql("SELECT order_id, city, region, amount FROM enriched ORDER BY order_id").show()''',
+         expl='''Joining a stream with a **static** DataFrame needs no state: each new order is looked up in the static table. The static side is re-read for every micro-batch, so updates to a dimension file are picked up.
 
-    dict(t='13.10 Save the model and score new customers', tables=['customers'],
-         code='''model.write().overwrite().save("models/churn_lr")
-loaded = PipelineModel.load("models/churn_lr")
+Stream–stream joins are also supported but need watermarks on both sides to bound the state.'''),
 
-new = spark.createDataFrame([(901, "Monthly", 2, 1400.0, 5), (902, "TwoYear", 48, 500.0, 0)],
-                            "cust_id INT, contract STRING, tenure INT, monthly_charges DOUBLE, support_calls INT")
-loaded.transform(new).select("cust_id", "contract", "tenure", "prediction").show()''',
-         expl='''A `PipelineModel` saves every fitted stage (indexer labels, scaler statistics, coefficients) to a folder; `PipelineModel.load` restores it in any other Spark job. New raw data goes in, predictions come out — no feature code to rewrite.
+    dict(t='13.9 Monitor a query: status and progress',
+         code='''q = (orders.writeStream.format("memory").queryName("monitor")
+        .trigger(availableNow=True).start())
+q.awaitTermination()
 
-The new-customer DataFrame has **no `churned` column**: only the input columns the stages need.'''),
+p = q.lastProgress
+print({k: p[k] for k in ["batchId", "numInputRows", "name"]})
+print(p["sources"][0]["description"])
+print(q.status["message"], "| active:", q.isActive)''',
+         expl='''`lastProgress` (and `recentProgress`) report every micro-batch: rows read, input and processing rates, durations, watermark and state size. `status` says what the query is doing right now.
 
-    dict(t='13.11 Without labels: KMeans clustering', tables=['customers'],
-         code='''from pyspark.ml.clustering import KMeans
-
-feats = VectorAssembler(inputCols=["tenure", "monthly_charges"], outputCol="f").transform(customers)
-scaled = StandardScaler(inputCol="f", outputCol="features").fit(feats).transform(feats)
-km = KMeans(k=3, seed=1).fit(scaled)
-
-(km.transform(scaled).groupBy("prediction")
-   .agg(F.count("*").alias("customers"), F.round(F.avg("tenure"), 1).alias("avg_tenure"),
-        F.round(F.avg("monthly_charges"), 0).alias("avg_charges"))
-   .orderBy("prediction").show())''',
-         expl='''**KMeans** groups customers into k clusters by similarity, with no label. Scaling first matters: otherwise `monthly_charges` (hundreds) would dominate `tenure` (tens).
-
-Describe each cluster with ordinary aggregations to turn cluster numbers into segments a business can use.'''),
+In production these numbers go to monitoring, and the Spark UI has a **Structured Streaming** tab with the same metrics as charts.'''),
 ]
 
 POINTS = '''
-1. **Estimator** `.fit(df)` → **Model** (a Transformer) `.transform(df)` adds columns.
-2. Features must be **one vector column**: `StringIndexer` → `OneHotEncoder` → `VectorAssembler` (→ `StandardScaler` for linear models).
-3. Put every step in a **Pipeline**; fit it on the training data only to avoid leakage. Save/load the whole `PipelineModel`.
-4. `randomSplit([0.75, 0.25], seed=…)` for a reproducible split; seed tree models too.
-5. Evaluate with `BinaryClassificationEvaluator` (AUC), `MulticlassClassificationEvaluator` (accuracy, F1), `RegressionEvaluator` (RMSE); build a confusion matrix with a pivot.
-6. Tune with `ParamGridBuilder` + `CrossValidator` (or the cheaper `TrainValidationSplit`).
+1. A stream is an **unbounded table**; Spark runs your query incrementally in **micro-batches**.
+2. `spark.readStream…` → transformations → `writeStream.format(sink).outputMode(mode).trigger(…).start()`.
+3. File streams need an explicit **schema**. Upstream must write files atomically (write, then rename).
+4. **Checkpoints** store progress and state → exactly-once results across restarts. One checkpoint per query.
 
-    | Task | Common MLlib classes |
+    | Output mode | Writes | Allowed with |
+    |---|---|---|
+    | `append` | only new final rows | no aggregation, or aggregation + watermark |
+    | `update` | rows that changed in this batch | aggregations |
+    | `complete` | the whole result table | aggregations only |
+
+    | Trigger | Behaviour |
     |---|---|
-    | Classification | `LogisticRegression`, `RandomForestClassifier`, `GBTClassifier` |
-    | Regression | `LinearRegression`, `RandomForestRegressor`, `GBTRegressor` |
-    | Clustering | `KMeans`, `BisectingKMeans` |
-    | Recommendation | `ALS` |
+    | default | next micro-batch as soon as the last one ends |
+    | `processingTime="1 minute"` | one micro-batch per minute |
+    | `availableNow=True` | process everything available, then stop |
+
+5. Group by **event time** with `F.window(ts, "10 minutes")`; bound state and late data with `withWatermark(ts, "10 minutes")`.
+6. `foreachBatch` lets you use the full batch API (Delta MERGE, JDBC, several sinks) on each micro-batch.
+7. Monitor with `lastProgress`, `status` and the Structured Streaming tab of the Spark UI.
 '''
 
-EXTRA_TITLE = 'Deep dive: MLlib in a real project'
-EXTRA_LEAD = 'When to use MLlib, and when to aggregate in Spark and train elsewhere.'
+EXTRA_TITLE = 'Deep dive: streaming in production'
+EXTRA_LEAD = 'Kafka, the errors you will meet first, and how exactly-once really works.'
 EXTRA = [
-    dict(t='MLlib, or Spark for features and scikit-learn for the model?',
-         md='''| Situation | Good choice |
-|---|---|
-| Training data does not fit on one machine | **MLlib** (distributed training) |
-| Training data fits in memory after aggregation | Spark for features → `toPandas()` → scikit-learn / XGBoost |
-| Many small models (one per store / product) | `groupBy().applyInPandas()` with scikit-learn inside (Chapter 11) |
-| Scoring a huge table with a model trained elsewhere | `mapInPandas` / pandas UDF that loads the model once per partition |
-| Deep learning | Dedicated frameworks (PyTorch, TensorFlow), with Spark for data preparation |''',
-         expl='''In practice, Spark's biggest role in ML is **feature engineering at scale**: the joins, windows and aggregations of Chapters 4–7 that turn billions of events into one row per customer.'''),
-    dict(t='Data leakage: fit transformers on the training set only',
-         md='''| Wrong | Right |
-|---|---|
-| `scaler.fit(all_data)` then split | split, then `pipeline.fit(train)` |
-| Encode categories seen only in the test set | `StringIndexer(handleInvalid="keep")` for unseen values at scoring time |
-| Features computed with future information (e.g. "total orders" including after the churn date) | Compute features only from data before the prediction date |''',
-         expl='''Leakage makes offline metrics look excellent and production results disappointing. A Pipeline fitted on the training split prevents the first two mistakes; the third is a modelling discipline — window functions with a time cut-off help.'''),
+    dict(t='Reading from Kafka', run=False,
+         code='''events = (spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", "broker1:9092,broker2:9092")
+    .option("subscribe", "orders")
+    .option("startingOffsets", "latest")
+    .load()
+    .select(F.from_json(F.col("value").cast("string"), schema).alias("o"))
+    .select("o.*"))
+
+(events.writeStream.format("parquet")
+    .option("path", "s3://lake/orders").option("checkpointLocation", "s3://lake/_chk/orders")
+    .trigger(processingTime="1 minute").start())''',
+         expl='''Not run in these notes (it needs a Kafka cluster and the `spark-sql-kafka` package). Kafka delivers `key` and `value` as **bytes**: cast `value` to string and parse it with `from_json` (Chapter 8).
+
+The checkpoint stores the Kafka **offsets** processed; together with an idempotent or transactional sink (file sink, Delta) that gives end-to-end exactly-once.'''),
+    dict(t='Error: a streaming DataFrame cannot show()', error=True,
+         code='''spark.readStream.schema(schema).json("data/stream/in").show()''',
+         expl='''`show`, `count` and `collect` would need the whole, never-ending table. Start a query with `writeStream` instead — to the `memory` sink when you just want to look at results while developing.'''),
+    dict(t='Error: append mode on an aggregation without a watermark', error=True,
+         code='''(spark.readStream.schema(schema).json("data/stream/in")
+      .groupBy("city").count()
+      .writeStream.format("memory").queryName("bad").outputMode("append").start())''',
+         expl='''In `append` mode a row may be written only once, when it is final. A per-city count is never final in an endless stream, so Spark refuses at start-up. Use `complete` or `update`, or aggregate by event-time window with a watermark.'''),
 ]
 
 MCQS = [
-    dict(q='In MLlib, what does calling `.fit(df)` on an Estimator return?', kind='concept',
-         o=['A DataFrame with predictions', 'A Model, which is a Transformer', 'Nothing — it trains in place', 'A Pipeline'], a=1,
-         why='Estimators learn from data and return a fitted Model; the model\'s transform() adds prediction columns.'),
-    dict(q='Why does a model need `VectorAssembler`?', kind='concept',
-         o=['To remove NULLs', 'MLlib models expect all features in a single vector column', 'To one-hot encode text', 'To split train and test'], a=1,
-         why='Every MLlib algorithm reads one features column of vector type.'),
-    dict(q='A `StandardScaler` was fitted on the full dataset before splitting into train and test. What is the problem?', kind='concept',
-         o=['Nothing', 'Data leakage: test-set statistics influenced training', 'The scaler only works on vectors', 'Scaling breaks logistic regression'], a=1,
-         why='Fit every transformer on the training data only — a Pipeline fitted on train does this automatically.'),
-    dict(q='What does this print?', kind='output', run=True, check='2',
-         code='''df = spark.createDataFrame([("a",), ("b",), ("c",)], ["cat"])
-idx = StringIndexer(inputCol="cat", outputCol="i").fit(df).transform(df)
-v = OneHotEncoder(inputCols=["i"], outputCols=["v"]).fit(idx).transform(idx)
-print(v.first().v.size)''',
-         o=['1', '2', '3', '4'], a=1,
-         why='With 3 categories and dropLast=True (the default), the one-hot vector has 3 − 1 = 2 positions.'),
-    dict(q='A CrossValidator has a grid of 4 parameter combinations and numFolds=5. How many models does it train before refitting the best one?', kind='concept',
-         o=['4', '5', '9', '20'], a=3,
-         why='Each of the 4 combinations is trained on each of the 5 folds: 20 fits, then one final fit of the best.'),
-    dict(q='Scoring fails on new data with an "unseen label" error from StringIndexer. What is the fix?', kind='debug',
-         code='''StringIndexer(inputCol="city", outputCol="city_idx")''',
-         o=['Drop the city column', 'Set `handleInvalid="keep"` so unseen categories get their own index', 'Use a larger dataset', 'Call fit on the new data'], a=1,
-         why='handleInvalid="keep" maps categories not seen during fit to an extra index instead of failing.'),
-    dict(q='Which metric is 0.5 for random guessing and 1.0 for a perfect ranking of positives above negatives?', kind='concept',
-         o=['Accuracy', 'RMSE', 'Area under the ROC curve (AUC)', 'Log loss'], a=2,
-         why='AUC measures ranking quality; random scores give 0.5.'),
+    dict(q='What does the checkpoint location of a streaming query store?', kind='concept',
+         o=['A copy of all input data', 'The progress (offsets / processed files) and the state of aggregations', 'The Spark UI logs', 'Only the schema'], a=1,
+         why='Checkpoints record which input was processed and the operator state, so a restarted query continues exactly where it stopped.'),
+    dict(q='Which output mode is **not** allowed for `groupBy("city").count()` on a stream without a watermark?', kind='concept',
+         o=['complete', 'update', 'append', 'All are allowed'], a=2,
+         why='append writes each row once when final; an unbounded per-city count is never final.'),
+    dict(q='A 10-minute watermark is set and the latest event seen is 12:30. An event stamped 12:05 arrives. What happens to it in a 10-minute windowed count?', kind='concept',
+         o=['It is counted in the 12:00–12:10 window', 'It is dropped because its window ended before the watermark (12:20)', 'The query fails', 'It is counted in the 12:30 window'], a=1,
+         why='Watermark = 12:30 − 10 min = 12:20. The 12:00–12:10 window is already finalised, so the late event is ignored.'),
+    dict(q='What does `trigger(availableNow=True)` do?', kind='concept',
+         o=['Runs one micro-batch every second', 'Processes all currently available data (possibly in several batches), then stops', 'Runs forever with minimal latency', 'Reads only the newest file'], a=1,
+         why='availableNow is designed for scheduled incremental jobs: catch up, then stop.'),
+    dict(q='Why must a producer write a file under a temporary name and then rename it into the watched folder?', kind='concept',
+         o=['Spark only reads files ending in .tmp', 'So the stream never reads a half-written file', 'Renaming compresses the file', 'It is required by JSON'], a=1,
+         why='A rename is atomic: the file appears complete or not at all.'),
+    dict(q='The code below raises an error. Why?', kind='debug',
+         code='''stream = spark.readStream.json("data/stream/in")''',
+         o=['json is not a streaming format', 'File streams need an explicit schema', 'The folder must be on HDFS', 'readStream needs .load()'], a=1,
+         why='Spark cannot infer a schema from data that has not arrived yet; pass .schema(...).'),
+    dict(q='Which API lets you MERGE each micro-batch into a Delta table or write it to a JDBC database?', kind='concept',
+         o=['`foreach`', '`foreachBatch`', '`mapInPandas`', '`writeStream.format("jdbc")`'], a=1,
+         why='foreachBatch gives you each micro-batch as a normal DataFrame, so any batch writer works.'),
 ]
 
 PRACTICE = dict(
-    kinds=['Rebuild the churn pipeline with GBTClassifier and compare AUC on the same split.',
-           'Add a derived feature (charges per month of tenure) and check whether AUC improves.',
-           'Build features from raw events with windows and aggregations, then train — the realistic workflow.'],
-    note='For practice datasets, the Telco Customer Churn and the Bank Marketing datasets are commonly used public examples; load them with an explicit schema.')
+    kinds=['Re-create this chapter with your own folder of JSON files; add files one by one and re-run with availableNow.',
+           'Windowed counts with a watermark — predict which late events are dropped, then check.',
+           'A foreachBatch sink that writes to Parquet and also prints per-batch row counts.',
+           'If you can run Docker: start a single Kafka broker and replace the file source with the Kafka source.'],
+    note='Streaming is learned by watching state change across runs; there is no LeetCode equivalent.')

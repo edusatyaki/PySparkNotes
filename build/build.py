@@ -104,18 +104,35 @@ def run_all(chapters):
         shutil.rmtree(WORK)
     WORK.mkdir(parents=True)
     os.chdir(WORK)
-    spark = (SparkSession.builder.master('local[4]').appName('class-notes')
-             .config('spark.ui.showConsoleProgress', 'false')
-             .config('spark.sql.session.timeZone', 'UTC')
-             .config('spark.driver.memory', '2g')
-             .getOrCreate())
-    spark.sparkContext.setLogLevel('ERROR')
+    from delta import configure_spark_with_delta_pip
+
+    def session(delta):
+        # Delta's session extension changes SQL analysis (e.g. named parameters stop binding),
+        # so only chapters that set DELTA = True run with it; the rest run on plain Spark.
+        builder = (SparkSession.builder.master('local[4]').appName('class-notes')
+                   .config('spark.ui.showConsoleProgress', 'false')
+                   .config('spark.sql.session.timeZone', 'UTC')
+                   .config('spark.driver.memory', '2g'))
+        if delta:
+            builder = (builder.config('spark.sql.extensions', 'io.delta.sql.DeltaSparkSessionExtension')
+                              .config('spark.sql.catalog.spark_catalog', 'org.apache.spark.sql.delta.catalog.DeltaCatalog'))
+        # the Delta JARs must be on the classpath when the JVM first starts, so add them for every session
+        sp = configure_spark_with_delta_pip(builder).getOrCreate()
+        sp.sparkContext.setLogLevel('ERROR')
+        return sp
+
+    mode = False
+    spark = session(False)
     only = set(a for a in sys.argv[2:] if not a.startswith('-'))
     results = json.loads(OUT_JSON.read_text()) if OUT_JSON.exists() and only else {}
     for ch in chapters:
         if only and ch.KEY not in only:
             continue
         print(f'── chapter {ch.KEY}: {ch.TITLE}', flush=True)
+        want = getattr(ch, 'DELTA', False)
+        if want != mode:
+            spark.stop()
+            spark, mode = session(want), want
         ns = {'spark': spark, '__name__': f'ch{ch.KEY}'}
         res = {}
         if getattr(ch, 'PREP', None):
@@ -590,14 +607,15 @@ def build_chapter(deck, ch, res):
 
 
 CH_COLORS = {
-    '1': ('#2563eb', '#eef4ff', '#c7d9fd', '#1d4ed8'), '2': ('#0f8a80', '#e9f8f6', '#b5e8e2', '#0b6e66'),
-    '3': ('#7c3aed', '#f3eeff', '#d9c8fb', '#6425d0'), '4': ('#c2410c', '#fff2ea', '#fed2b8', '#9a3412'),
-    '5': ('#a21caf', '#fbeefd', '#f0c4f5', '#86198f'), '6': ('#15803d', '#ecf9f0', '#bce8cb', '#166534'),
-    '7': ('#0e7490', '#e8f7fb', '#b3e3ef', '#155e75'), '8': ('#be185d', '#fdeef4', '#f8c5da', '#9d174d'),
-    '9': ('#4f46e5', '#efeffe', '#cfcdfb', '#3730a3'), '10': ('#b45309', '#fff6e6', '#fbdca6', '#92400e'),
-    '11': ('#b91c1c', '#fdeeee', '#f6c4c4', '#991b1b'), '12': ('#0369a1', '#e9f5fd', '#b9e0f7', '#075985'),
-    '13': ('#4d7c0f', '#f1f8e6', '#d3e9b0', '#3f6212'), '14': ('#9333ea', '#f6eefe', '#e2cbfb', '#7e22ce'),
-    'QR': ('#475569', '#f1f4f8', '#cfd8e3', '#334155'),
+    '0': ('#334155', '#f1f5f9', '#cbd5e1', '#1e293b'), '1': ('#2563eb', '#eef4ff', '#c7d9fd', '#1d4ed8'),
+    '2': ('#0f8a80', '#e9f8f6', '#b5e8e2', '#0b6e66'), '3': ('#b45309', '#fff6e6', '#fbdca6', '#92400e'),
+    '4': ('#64748b', '#f3f5f8', '#d3dae3', '#475569'), '5': ('#ca8a04', '#fefbe8', '#f6e3a1', '#a16207'),
+    '6': ('#15803d', '#ecf9f0', '#bce8cb', '#166534'), '7': ('#0e7490', '#e8f7fb', '#b3e3ef', '#155e75'),
+    '8': ('#a21caf', '#fbeefd', '#f0c4f5', '#86198f'), '9': ('#be185d', '#fdeef4', '#f8c5da', '#9d174d'),
+    '10': ('#c2410c', '#fff2ea', '#fed2b8', '#9a3412'), '11': ('#b91c1c', '#fdeeee', '#f6c4c4', '#991b1b'),
+    '12': ('#0369a1', '#e9f5fd', '#b9e0f7', '#075985'), '13': ('#7c3aed', '#f3eeff', '#d9c8fb', '#6425d0'),
+    '14': ('#4f46e5', '#efeffe', '#cfcdfb', '#3730a3'), '15': ('#047857', '#e8f8f1', '#b0e6cf', '#065f46'),
+    '16': ('#4d7c0f', '#f1f8e6', '#d3e9b0', '#3f6212'), '17': ('#475569', '#f1f4f8', '#cfd8e3', '#334155'),
 }
 
 
@@ -633,13 +651,13 @@ def render(chapters, results):
         home_cards.append((ch, first, pages))
     # closing slide
     closing = ('<div class="cover-in"><p class="eyebrow">The end of the notes</p><h1>You can now read a Spark plan<br><span>and write the pipeline behind it</span></h1><div class="rule"></div>\n'
-               '<p class="lead">Go back to any chapter from the menu, re-run the rapid-fire quiz on the chapters you missed, and build one capstone end to end: '
-               'raw CSV in, partitioned Parquet out, a window function, a broadcast join, a test, and the physical plan of the heaviest query in the README.</p>\n'
+               '<p class="lead">Go back to any chapter from the menu, re-run the rapid-fire quiz on the chapters you missed, and rebuild the ShopKart capstone on your own data: '
+               'Bronze, Silver and Gold Delta tables, an SCD2 dimension, quality gates, tests, and the physical plan of the heaviest query in the README.</p>\n'
                '<div class="cover-go"><button type="button" class="btn" data-act="menu">Chapters</button><button type="button" class="btn ghost" data-act="revisit">Revisit list</button>'
                '<button type="button" class="btn ghost" data-act="rapid" data-ch="*">Rapid fire — all chapters</button></div></div>')
     deck.add('cover', '', 'The end', closing)
     nch = len(chapters)
-    cover = ('<div class="cover-in">\n<p class="eyebrow">Class notes · Data Engineering</p>\n<h1>PySpark Class Notes<br><span>from SparkSession to streaming, presented</span></h1>\n<div class="rule"></div>\n'
+    cover = ('<div class="cover-in">\n<p class="eyebrow">Class notes · Data Engineering</p>\n<h1>PySpark Class Notes<br><span>from Spark theory to a lakehouse pipeline, presented</span></h1>\n<div class="rule"></div>\n'
              '<p class="lead">Every topic as a question, the PySpark code, the real output from Spark and an explanation — with the DataFrame beside every query, '
              'deep dives into Spark internals, MCQs, predict-the-output questions, and the LeetCode problems to solve in PySpark after each chapter.</p>\n'
              f'<div class="cover-stats"><div><b>{nch}</b><span>chapters</span></div><div><b>{stats["sec"]}</b><span>sections with real output</span></div>'

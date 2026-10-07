@@ -1,7 +1,7 @@
 ORDER = 11
 KEY = '11'
 TITLE = 'UDFs, pandas UDFs and the pandas API on Spark'
-WEEK = 'Week 6'
+WEEK = 'Week 5'
 DATA = ['reviews']
 
 SETUP_TITLE = '11.0 The data — product reviews'

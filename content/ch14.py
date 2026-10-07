@@ -63,7 +63,7 @@ In a real project this function lives in `tests/test_transforms.py` and runs wit
          code='''given = spark.createDataFrame([(1, "  pune "), (2, "navi  mumbai")], "order_id INT, city STRING")
 expected = spark.createDataFrame([(1, "Pune"), (2, "Navi Mumbai")], "order_id INT, city STRING")
 assertDataFrameEqual(clean_city(given), expected)''',
-         expl='''The test found a real bug: `trim` does not collapse the double space inside "navi  mumbai" (Chapter 3 had the fix — `regexp_replace("\\s+", " ")`). The error lists the rows that differ, so you can see exactly what came out.
+         expl='''The test found a real bug: `trim` does not collapse the double space inside "navi  mumbai" (Chapter 4 had the fix — `regexp_replace("\\s+", " ")`). The error lists the rows that differ, so you can see exactly what came out.
 
 This is why tests use **edge cases**: the happy path passed on the previous slide.'''),
 
@@ -141,8 +141,8 @@ POINTS = '''
     | **Gold** | Business aggregates for reports and ML |
 '''
 
-EXTRA_TITLE = 'Deep dive: shipping and table formats'
-EXTRA_LEAD = 'How the job runs on a cluster, and why teams store data in Delta Lake or Iceberg.'
+EXTRA_TITLE = 'Deep dive: shipping the job'
+EXTRA_LEAD = 'How the code is organised and how it runs on a cluster. (Delta Lake, MERGE and the medallion layers are in Chapter 12.)'
 EXTRA = [
     dict(t='A project layout that scales',
          md='''| Path | Holds |
@@ -165,23 +165,6 @@ EXTRA = [
          expl='''Not run in these notes (it needs a cluster). `spark-submit` starts the driver and executors, ships your code (`--py-files` takes a wheel or zip), and passes arguments to `main.py`. In `cluster` deploy mode the driver runs on the cluster, so the job survives your laptop disconnecting.
 
 Schedulers (Airflow, Databricks Workflows, cron) call exactly this command once per day with a different `--run-date`.'''),
-    dict(t='Why Delta Lake / Iceberg instead of plain Parquet folders',
-         md='''| Problem with plain Parquet | What a table format adds |
-|---|---|
-| A failed overwrite leaves half-written data | **ACID transactions**: a write commits fully or not at all |
-| Updating one row means rewriting files by hand | `MERGE INTO`, `UPDATE`, `DELETE` |
-| A bad load cannot be undone | **Time travel**: read or restore an older version |
-| Readers see files appear one by one | Snapshot isolation: readers see the last committed version |
-| Schema drift goes unnoticed | Schema enforcement and controlled evolution |
-| Many small files accumulate | `OPTIMIZE` compaction and clustering |''',
-         expl='''Delta Lake and Apache Iceberg keep Parquet files and add a **transaction log** beside them. Both plug into Spark as a data source (`format("delta")` / `format("iceberg")`) once their package is added to the session; they are not part of plain PySpark, so these notes do not run them.'''),
-    dict(t='The upsert you will write most often: MERGE', run=False, file='merge.sql — Delta Lake syntax, not run here',
-         code='''MERGE INTO silver.customers AS t
-USING updates AS s
-  ON t.customer_id = s.customer_id
-WHEN MATCHED AND s.updated_at > t.updated_at THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *''',
-         expl='''A daily feed of changed customers is merged into the table: existing customers are updated only if the change is newer, new customers are inserted. Combined with `foreachBatch` (Chapter 12), the same statement keeps a table up to date from a stream.'''),
 ]
 
 MCQS = [

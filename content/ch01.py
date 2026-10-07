@@ -1,6 +1,6 @@
 ORDER = 1
 KEY = '1'
-TITLE = 'Getting Started: SparkSession, Architecture and Lazy Evaluation'
+TITLE = 'Getting Started: SparkSession, partitions and lazy evaluation in code'
 WEEK = 'Week 1'
 DATA = ['students']
 
@@ -155,17 +155,8 @@ POINTS = '''
 '''
 
 EXTRA_TITLE = 'Deep dive: how Spark runs your code'
-EXTRA_LEAD = 'What happens between calling an action and seeing the answer — the vocabulary every Spark interview uses.'
+EXTRA_LEAD = 'Chapter 0 described the architecture; these slides connect it to what you just ran.'
 EXTRA = [
-    dict(t='Driver, executors and the cluster manager',
-         md='''| Part | What it does | On your laptop (`local[4]`) |
-|---|---|---|
-| **Driver** | Runs your Python program, builds the plan, splits it into tasks, collects results | The Python process + a JVM |
-| **Executors** | JVM processes that run tasks and hold cached data | Threads inside the same JVM |
-| **Cluster manager** | Hands out machines and memory to the application | Not needed |
-| **Task** | One unit of work on one partition | One thread |''',
-         expl='''On a real cluster the cluster manager is YARN, Kubernetes or Spark Standalone, and each executor is a separate JVM on a worker machine. The driver never touches the data itself unless you `collect()` it.''',
-         tip='PySpark is a thin Python layer: your DataFrame calls are sent to the JVM through Py4J, and the JVM does the real work. That is why built-in functions are fast and Python UDFs are slow.'),
     dict(t='Job → stages → tasks',
          md='''| Level | Created by | Example |
 |---|---|---|
@@ -182,14 +173,6 @@ print(plan.toDebugString().decode())''',
          expl='''Spark does not copy data for safety. It remembers the **lineage** — the chain of steps that produced each partition. If an executor dies, Spark re-runs those steps for just the lost partitions.
 
 The `map` and `filter` lambdas were fused into one `PythonRDD` step, built on the `ParallelCollectionRDD` that holds the original numbers; `(2)` is the partition count. That is the "Resilient" in RDD, and it is why transformations must be deterministic.'''),
-    dict(t='Spark, pandas and PostgreSQL side by side',
-         md='''| | pandas | PostgreSQL | Spark |
-|---|---|---|---|
-| Runs on | One machine, in memory | One server (plus replicas) | Many machines |
-| Data size | Up to RAM | Up to disk of one server | Terabytes to petabytes |
-| Evaluation | Eager — every line runs now | Per query | Lazy — runs on an action |
-| Storage | None of its own | Its own tables | Files you own: Parquet, Delta, CSV |
-| Best for | Small analysis, plotting | Transactions, OLTP | Batch ETL, big aggregations, streaming |'''),
 ]
 
 MCQS = [

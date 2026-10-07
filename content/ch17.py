@@ -1,6 +1,6 @@
-ORDER = 15
-KEY = 'QR'
-TITLE = 'The Whole Course on One Page: SQL ↔ PySpark'
+ORDER = 17
+KEY = '17'
+TITLE = 'Quick Reference: the whole course on one page (SQL ↔ PySpark)'
 WEEK = 'Quick reference'
 
 SECTIONS = [
@@ -53,6 +53,16 @@ SECTIONS = [
 | NULLs | `isNull`, `isNotNull`, `coalesce`, `fillna`, `dropna`, `nullif`, `eqNullSafe` |
 | Arrays / maps | `explode(_outer)`, `size`, `array_contains`, `collect_list`, `collect_set`, `transform`, `filter` |
 | JSON | `from_json`, `to_json`, `get_json_object` |'''),
+    dict(t='Delta Lake and the medallion layers', md='''| Task | PySpark |
+|---|---|
+| Write / read | `df.write.format("delta").save(p)` · `spark.read.format("delta").load(p)` |
+| Old version | `.option("versionAsOf", 3)` · `DeltaTable.forPath(spark, p).history()` |
+| Upsert | `dt.alias("t").merge(s.alias("s"), "t.id = s.id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()` |
+| Allow a new column | `.option("mergeSchema", "true")` |
+| Undo / compact | `dt.restoreToVersion(3)` · `dt.optimize().executeCompaction()` |
+| Bronze | raw text + `_source_file`, `_ingest_date`; append |
+| Silver | `try_cast`, validate, quarantine, `row_number` dedup, MERGE / SCD2 |
+| Gold | aggregates rebuilt from Silver; join SCD2 dims by key **and** date range |'''),
     dict(t='Performance checklist', md='''| Check | How |
 |---|---|
 | How many shuffles? | Count `Exchange` in `df.explain()` |

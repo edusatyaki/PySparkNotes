@@ -1,247 +1,324 @@
 ORDER = 4
 KEY = '4'
-TITLE = 'Aggregations: groupBy, agg, HAVING, pivot and rollup'
+TITLE = 'Built-in Functions: strings, numbers, dates, NULLs — cleaning = Silver'
 WEEK = 'Week 2'
-DATA = ['sales']
+DATA = ['employees']
 
-SETUP_TITLE = '4.0 The data — one row per order line'
+SETUP_TITLE = '4.0 The data — deliberately messy'
 SETUP = '''from pyspark.sql import functions as F
 
-sales = spark.createDataFrame([
-    (1, "2026-01-05", "North", "Delhi",   "Electronics", "Headphones", 2, 1500.0),
-    (2, "2026-01-07", "West",  "Mumbai",  "Fashion",     "Jeans",      1, 1200.0),
-    (3, "2026-01-12", "North", "Delhi",   "Fashion",     "T-shirt",    3,  400.0),
-    (4, "2026-01-20", "South", "Chennai", "Electronics", "Phone",      1, 18000.0),
-    (5, "2026-02-02", "West",  "Pune",    "Home",        "Lamp",       2,  900.0),
-    (6, "2026-02-03", "North", "Jaipur",  "Electronics", "Charger",    4,  600.0),
-    (7, "2026-02-14", "South", "Bengaluru","Fashion",    "Jacket",     1, 3500.0),
-    (8, "2026-02-18", "West",  "Mumbai",  "Electronics", "Phone",      1, 21000.0),
-    (9, "2026-03-01", "East",  "Kolkata", "Home",        "Bedsheet",   2, 1100.0),
-    (10,"2026-03-04", "South", "Chennai", "Home",        "Lamp",       1,  950.0),
-    (11,"2026-03-09", "North", "Delhi",   "Electronics", "Headphones", 1, 1500.0),
-    (12,"2026-03-15", "East",  "Kolkata", "Fashion",     "Saree",      1, 4500.0),
-    (13,"2026-03-21", "West",  "Pune",    "Fashion",     "T-shirt",    5,  350.0),
-    (14,"2026-03-28", "South", "Bengaluru","Electronics","Charger",    2,  650.0),
-], "order_id INT, order_date STRING, region STRING, city STRING, "
-   "category STRING, product STRING, qty INT, price DOUBLE") \\
-   .withColumn("order_date", F.to_date("order_date")) \\
-   .withColumn("amount", F.col("qty") * F.col("price"))'''
-SETUP_EXPL = '''Fourteen order lines across four regions and three categories. `amount = qty × price` is computed once in the setup so every later query can use it.
+employees = spark.createDataFrame([
+    (101, "  ravi KUMAR ", "ravi.kumar@infosys.com", "Engineering", 85250.4567, "2021-03-15", "9876543210", None),
+    (102, "Sara Khan",     "sara@tcs.co.in",         "Sales",       62000.0,    "2022-11-01", None,         101),
+    (103, "arjun mehta",   "arjun.m@wipro.com",      "Engineering", 91000.555,  "2019-07-22", "9123456780", 101),
+    (104, "Priya Nair",    "priya.nair@infosys.com", "HR",          None,       "2023-01-09", "98765",      102),
+    (105, "DEV  sharma",   "dev@zoho.in",            None,          54000.5,    "2020-05-30", "9988776655", 102),
+    (106, "Neha Gupta",    "neha.g@tcs.co.in",       "Sales",       71000.0,    "2024-02-29", None,         None),
+], "emp_id INT, name STRING, email STRING, dept STRING, salary DOUBLE, "
+   "join_date STRING, phone STRING, manager_id INT")'''
+SETUP_EXPL = '''Six employees with the problems real data has: names with stray spaces and random capitals, salaries with too many decimals, dates stored as **text**, a 5-digit phone number, and NULLs in `dept`, `salary`, `phone` and `manager_id`.
 
-Grouping is a **wide** transformation: rows with the same key must meet on one partition, so every `groupBy` adds a shuffle.'''
+Every function in this chapter comes from `pyspark.sql.functions` (imported as `F`) and runs inside the JVM — no Python per row.'''
 
 SECTIONS = [
-    dict(t='4.1 Totals over the whole table (agg without groupBy)', tables=['sales'],
-         code='''sales.agg(
-    F.count("*").alias("orders"),
-    F.sum("amount").alias("revenue"),
-    F.round(F.avg("amount"), 2).alias("avg_order"),
-    F.min("amount").alias("smallest"),
-    F.max("amount").alias("largest"),
+    dict(divider=True, t='Strings'),
+    dict(t='4.1 Fix the messy names: trim, lower, initcap', tables=['employees'], home=True,
+         code='''employees.select(
+    "name",
+    F.initcap(F.lower(F.trim("name"))).alias("clean"),
+    F.upper("name").alias("upper"),
+).show(truncate=False)''',
+         expl='''`trim` removes spaces at both ends (`ltrim` / `rtrim` for one side). `lower` then `initcap` gives "Ravi Kumar" whatever the original capitals were.
+
+The inner double space in "DEV  sharma" survives — `trim` only cleans the ends. The next slide fixes that with a regular expression.'''),
+
+    dict(t='4.2 Collapse inner spaces and measure length: regexp_replace, length', tables=['employees'],
+         code='''tidy = F.initcap(F.lower(F.trim(F.regexp_replace("name", r"\\s+", " "))))
+
+employees.select(tidy.alias("name"),
+                 F.length("name").alias("raw_len"),
+                 F.length(tidy).alias("clean_len")).show()''',
+         expl='''`regexp_replace(col, pattern, replacement)` uses Java regular expressions: `\\s+` = one or more whitespace characters, replaced by a single space.
+
+A Column expression can be stored in a Python variable (`tidy`) and reused — it is just a description of the computation until a query runs it.'''),
+
+    dict(t='4.3 Build and split text: concat_ws, split, substring', tables=['employees'],
+         code='''employees.select(
+    F.concat_ws(" | ", "emp_id", "dept").alias("label"),
+    F.split("email", "@").getItem(1).alias("domain"),
+    F.substring("join_date", 1, 4).alias("year_text"),
+).show(truncate=False)''',
+         expl='''`concat_ws(sep, …)` joins columns with a separator and **skips NULLs** (employee 105 shows just `105`). Plain `concat` returns NULL if any piece is NULL.
+
+`split` returns an **array**; `getItem(1)` takes the second element. `substring(col, pos, len)` counts from **1**, like SQL.'''),
+
+    dict(t='4.4 Extract and mask with regular expressions', tables=['employees'],
+         code='''employees.select(
+    "email",
+    F.regexp_extract("email", r"@([a-z]+)\\.", 1).alias("company"),
+    F.regexp_replace("phone", r"\\d(?=\\d{4})", "*").alias("masked_phone"),
+).show(truncate=False)''',
+         expl='''`regexp_extract(col, pattern, group)` returns one capture group — here the word after `@`. If there is no match it returns an empty string, not NULL.
+
+The mask pattern `\\d(?=\\d{4})` means "a digit that still has 4 digits after it", so every digit except the last four becomes `*`. NULL phones stay NULL.'''),
+
+    dict(t='4.5 Pad and validate: lpad, rpad and a length check', tables=['employees'],
+         code='''employees.select(
+    F.lpad(F.col("emp_id").cast("string"), 6, "0").alias("emp_code"),
+    "phone",
+    (F.length("phone") == 10).alias("valid_phone"),
 ).show()''',
-         expl='''`agg` without `groupBy` aggregates the whole DataFrame into **one row**. Give every aggregate an `alias`, otherwise you get names like `sum(amount)`.
+         expl='''`lpad(col, width, pad)` pads on the left to a fixed width — handy for codes like `000101`. Note that `lpad` also **cuts** values longer than the width.
 
-`F.count("*")` counts rows; `F.count("col")` counts non-NULL values of that column.'''),
+The check returns `false` for the 5-digit number and **NULL** (not false) for a NULL phone: any comparison with NULL is NULL.'''),
 
-    dict(t='4.2 Revenue per region (groupBy + agg)', tables=['sales'], home=True,
-         code='''(sales.groupBy("region")
-      .agg(F.count("*").alias("orders"),
-           F.sum("amount").alias("revenue"))
-      .orderBy(F.desc("revenue"))
-      .show())''',
-         expl='''`groupBy(cols).agg(...)` returns one row per group. The output has no guaranteed order — add `orderBy` when order matters.
+    dict(divider=True, t='Numbers'),
+    dict(t='4.6 Round the salaries: round, bround, floor, ceil', tables=['employees'],
+         code='''employees.select(
+    "salary",
+    F.round("salary", 2).alias("round_2"),
+    F.round("salary", -3).alias("nearest_1000"),
+    F.floor("salary").alias("floor"),
+    F.ceil("salary").alias("ceil"),
+).show()''',
+         expl='''`round(col, scale)` rounds half **up**; a negative scale rounds to tens, hundreds, thousands. `floor` always goes down and `ceil` always up; both return integers (`long`).
 
-Shortcut methods exist (`groupBy("region").sum("amount")`), but `agg` lets you compute several aggregates with clean aliases in one pass.'''),
+`bround` rounds half to **even** (banker's rounding): `bround(2.5)` = 2, `bround(3.5)` = 4. It avoids an upward bias when you round millions of values.'''),
 
-    dict(t='4.3 Group by two columns', tables=['sales'],
-         code='''(sales.groupBy("region", "category")
-      .agg(F.sum("qty").alias("units"), F.sum("amount").alias("revenue"))
-      .orderBy("region", "category")
-      .show())''',
-         expl='''One output row per **combination** of region and category that actually occurs in the data. Combinations with no orders (East–Electronics) simply do not appear — `pivot` on the next slides shows them as NULL cells.'''),
+    dict(t='4.7 Distance, parity and limits: abs, %, greatest, least', tables=['employees'],
+         code='''employees.select(
+    "emp_id", "salary",
+    F.round(F.abs(F.col("salary") - 70000)).alias("gap_from_70k"),
+    (F.col("emp_id") % 2 == 1).alias("odd_id"),
+    F.greatest("salary", F.lit(60000.0)).alias("at_least_60k"),
+    F.least("salary", F.lit(80000.0)).alias("capped_80k"),
+).show()''',
+         expl='''`abs` gives the distance from a target, `%` the remainder (here: is the ID odd?). `greatest` and `least` compare values **across columns in one row** — a floor and a cap on salary — unlike `max`/`min`, which aggregate down a column.
 
-    dict(t='4.4 Only the regions above ₹20,000 (HAVING)', tables=['sales'],
-         code='''(sales.groupBy("region")
-      .agg(F.sum("amount").alias("revenue"))
-      .filter(F.col("revenue") > 20000)
-      .show())''',
-         expl='''There is no `having` method: a `filter` **after** `agg` is HAVING, because it runs on the aggregated rows. A `filter` **before** `groupBy` is WHERE — it removes order lines before they are summed.
+`greatest` and `least` skip NULLs: for the NULL salary they return the other argument, 60000 and 80000. Arithmetic with NULL (`abs`, `%`) stays NULL.'''),
 
-Spark's optimiser places each filter correctly in the plan; you only need the right position in your code.'''),
+    dict(divider=True, t='Dates and times'),
+    dict(t='4.8 Text to real dates: to_date', tables=['employees'],
+         code='''dated = employees.withColumn("join_date", F.to_date("join_date", "yyyy-MM-dd"))
+dated.select("emp_id", "join_date").printSchema()
+dated.select("emp_id", "join_date").show(3)''',
+         expl='''`to_date(col, format)` parses text into a `DateType`. The pattern letters are Java's: `yyyy` year, `MM` month, `dd` day, `HH` hour, `mm` **minute**. Mixing up `MM` and `mm` is the classic bug.
 
-    dict(t='4.5 Distinct counts: countDistinct vs approx_count_distinct', tables=['sales'],
-         code='''sales.groupBy("region").agg(
-    F.count("*").alias("lines"),
-    F.countDistinct("product").alias("products"),
-    F.approx_count_distinct("city").alias("cities_approx"),
-).orderBy("region").show()''',
-         expl='''`countDistinct` is exact but expensive on big data: Spark must keep every distinct value. `approx_count_distinct` uses the HyperLogLog++ sketch — a small fixed amount of memory, about 5% error by default, and exact on small data like this.
+From now on the rest of the chapter uses `dated`, where `join_date` is a real date.'''),
 
-On billions of rows (daily active users, unique visitors), the approximate version is often 10× faster.'''),
+    dict(t='4.9 Pull pieces out of a date', tables=['dated'],
+         code='''dated.select(
+    "join_date",
+    F.year("join_date").alias("year"),
+    F.month("join_date").alias("month"),
+    F.dayofmonth("join_date").alias("day"),
+    F.date_format("join_date", "EEEE").alias("weekday"),
+    F.quarter("join_date").alias("q"),
+).show()''',
+         expl='''`year`, `month`, `dayofmonth`, `quarter`, `dayofweek` (1 = Sunday) and `weekofyear` return integers. `date_format` turns a date into **text** with any pattern — `EEEE` is the full weekday name, `MMM` a short month name.
 
-    dict(t='4.6 Conditional aggregation: sum(when) and count_if', tables=['sales'],
-         code='''sales.groupBy("region").agg(
-    F.sum(F.when(F.col("category") == "Electronics", F.col("amount")).otherwise(0))
-     .alias("electronics_rev"),
-    F.count_if(F.col("amount") >= 5000).alias("big_orders"),
-    F.round(F.avg(F.when(F.col("category") == "Fashion", F.col("amount"))), 1)
-     .alias("avg_fashion"),
-).orderBy("region").show()''',
-         expl='''Putting `when` **inside** an aggregate filters per column instead of per query — several "filtered totals" in one pass. This is SQL's `SUM(CASE WHEN …)` / `COUNT(*) FILTER (WHERE …)`.
+2024-02-29 is valid: 2024 was a leap year.'''),
 
-In the `avg` there is no `otherwise`, so non-Fashion rows become NULL and `avg` ignores them — the average is over Fashion orders only. With `otherwise(0)` the zeros would drag it down.'''),
+    dict(t='4.10 Date arithmetic: datediff, months_between, add_months', tables=['dated'],
+         code='''ref = F.lit("2026-10-06").cast("date")
 
-    dict(t='4.7 Keep the values, not just the count: collect_list and collect_set', tables=['sales'],
-         code='''(sales.groupBy("region")
-      .agg(F.collect_list("product").alias("all_products"),
-           F.array_sort(F.collect_set("category")).alias("categories"))
-      .orderBy("region")
-      .show(truncate=False))''',
-         expl='''`collect_list` gathers every value into an array (duplicates kept, order not guaranteed); `collect_set` removes duplicates. Wrap with `array_sort` for a stable order.
+dated.select(
+    "emp_id", "join_date",
+    F.datediff(ref, "join_date").alias("days_in_company"),
+    F.floor(F.months_between(ref, "join_date") / 12).alias("years"),
+    F.date_add("join_date", 90).alias("probation_end"),
+    F.add_months("join_date", 12).alias("first_review"),
+).show()''',
+         expl='''`datediff(end, start)` counts days; `months_between` returns fractional months, so whole years = `floor(months / 12)`. `date_add` adds days and `add_months` adds calendar months — adding 12 months to 2024-02-29 gives 2025-02-28 because the result is clamped to the last valid day.
 
-Both build the whole array on one executor, so never `collect_list` a group with millions of values.'''),
+A fixed reference date keeps the notes reproducible; in real code use `F.current_date()`.'''),
 
-    dict(t='4.8 Monthly revenue: group by a derived column', tables=['sales'],
-         code='''(sales.groupBy(F.date_trunc("month", "order_date").cast("date").alias("month"))
-      .agg(F.sum("amount").alias("revenue"), F.count("*").alias("orders"))
-      .orderBy("month")
-      .show())''',
-         expl='''`groupBy` accepts expressions, not only column names. Truncating the date to the month start is the standard way to build a monthly time series.
+    dict(t='4.11 Bucket rows by month: date_trunc and last_day', tables=['dated'],
+         code='''dated.select(
+    "join_date",
+    F.date_trunc("month", "join_date").alias("month_start"),
+    F.trunc("join_date", "year").alias("year_start"),
+    F.last_day("join_date").alias("month_end"),
+).show()''',
+         expl='''`date_trunc(unit, col)` rounds down to the start of a unit and returns a **timestamp**; `trunc(col, unit)` does the same but returns a **date** (note the argument order is swapped). `last_day` gives the last day of the month.
 
-`date_trunc` returns a timestamp; the `cast("date")` drops the `00:00:00`.'''),
+Truncating is how you group daily data by month or year.'''),
 
-    dict(t='4.9 Turn categories into columns (pivot)', tables=['sales'],
-         code='''(sales.groupBy("region")
-      .pivot("category", ["Electronics", "Fashion", "Home"])
-      .agg(F.sum("amount"))
-      .orderBy("region")
-      .show())''',
-         expl='''`pivot(col, values)` makes one output column per value. Listing the values is optional but recommended: without the list Spark runs an extra job to find the distinct values first.
+    dict(divider=True, t='CASE WHEN and NULLs'),
+    dict(t='4.12 Give each salary a band: when / otherwise', tables=['employees'],
+         code='''employees.select(
+    "emp_id", "salary",
+    F.when(F.col("salary") >= 80000, "High")
+     .when(F.col("salary") >= 60000, "Medium")
+     .when(F.col("salary").isNotNull(), "Low")
+     .otherwise("Unknown").alias("band"),
+).show()''',
+         expl='''`F.when(cond, value).when(…).otherwise(default)` is SQL `CASE WHEN … ELSE … END`. Conditions are checked **top to bottom** and the first true one wins, so order the bands from strictest to loosest.
 
-Empty cells are NULL (East sold no Electronics). Add `.fillna(0)` for a report.'''),
+Without `.otherwise`, rows that match nothing get NULL. Here the NULL salary falls through to `"Unknown"`.'''),
 
-    dict(t='4.10 Columns back into rows (unpivot)', tables=['sales'],
-         code='''wide = (sales.groupBy("region").pivot("category", ["Electronics", "Fashion", "Home"])
-             .agg(F.sum("amount")).fillna(0))
+    dict(t='4.13 Find the missing values: isNull, isNotNull', tables=['employees'],
+         code='''employees.filter(F.col("phone").isNull()).select("emp_id", "phone").show()
 
-long = wide.unpivot("region", ["Electronics", "Fashion", "Home"], "category", "revenue")
-long.orderBy("region", "category").show(6)''',
-         expl='''`unpivot(ids, values, variableColumnName, valueColumnName)` (Spark 3.4+, also called `melt`) reverses a pivot: one row per region × category.
+print(employees.filter(F.col("phone") == None).count())''',
+         expl='''`isNull()` / `isNotNull()` are the correct tests. Comparing with `== None` produces `phone = NULL`, which is NULL for every row, so the second filter keeps **nothing** — the count is 0.
 
-Long format is what you store and group; wide format is what you show in a report.'''),
+This is the same three-valued logic as SQL: NULL means unknown, and unknown is never equal to anything.'''),
 
-    dict(t='4.11 Subtotals and a grand total (rollup)', tables=['sales'],
-         code='''(sales.rollup("region", "category")
-      .agg(F.sum("amount").alias("revenue"))
-      .orderBy(F.col("region").asc_nulls_last(), F.col("category").asc_nulls_last())
-      .show(25))''',
-         expl='''`rollup(a, b)` computes `(a, b)`, then `(a)` subtotals, then the grand total `()`. NULL in a key column means "all values" — `North, NULL` is the North subtotal and `NULL, NULL` is the grand total.
+    dict(t='4.14 Count NULLs in every column at once', tables=['employees'],
+         code='''employees.select([
+    F.count(F.when(F.col(c).isNull(), 1)).alias(c)
+    for c in employees.columns
+]).show()''',
+         expl='''A Python list comprehension builds one expression per column; `count` ignores NULLs, so `count(when(isNull, 1))` counts exactly the missing values.
 
-`asc_nulls_last` puts each subtotal after its detail rows.'''),
+This one-liner is the first thing to run on any new dataset.'''),
 
-    dict(t='4.12 Every combination of subtotals (cube) and grouping_id', tables=['sales'],
-         code='''(sales.cube("region", "category")
-      .agg(F.sum("amount").alias("revenue"), F.grouping_id().alias("gid"))
-      .filter(F.col("gid") == 2)          # category subtotals only
-      .orderBy("category")
-      .show())''',
-         expl='''`cube(a, b)` adds the subtotals for **every** subset of the keys, including `(b)` alone — category totals across all regions — which `rollup` does not produce.
+    dict(t='4.15 Fill the gaps: fillna, coalesce', tables=['employees'],
+         code='''employees.fillna({"dept": "Unassigned", "salary": 0}) \\
+         .select("emp_id", "dept", "salary").show()
 
-`grouping_id()` tells real NULLs apart from "all" NULLs: it is a bit mask of which keys are rolled up (here region rolled up = binary `10` = 2).'''),
+employees.select("emp_id",
+    F.coalesce("phone", F.lit("no phone")).alias("contact")).show()''',
+         expl='''`fillna(dict)` replaces NULLs per column; the value type must match the column type (a number for `salary`, text for `dept`).
 
-    dict(t='4.13 Quick statistics: describe and summary', tables=['sales'],
-         code='''sales.select("qty", "price", "amount").describe().show()
-sales.select("amount").summary("count", "min", "25%", "50%", "75%", "max").show()''',
-         expl='''`describe()` returns count, mean, stddev, min and max for each column; `summary()` adds approximate percentiles and lets you choose the statistics.
+`coalesce(a, b, …)` returns the first non-NULL argument — use it inside expressions, e.g. a fallback from a second column.'''),
 
-The values come back as **strings** — the output is meant for reading, not for further calculation.'''),
+    dict(t='4.16 Drop incomplete rows: dropna', tables=['employees'],
+         code='''print(employees.dropna().count())                       # any NULL anywhere
+print(employees.dropna(subset=["dept", "salary"]).count())
+print(employees.dropna(thresh=7).count())              # at least 7 non-NULL values''',
+         expl='''`dropna()` with no arguments removes a row if **any** column is NULL — usually far too aggressive (only 1 of 6 rows survives). Limit it with `subset=[…]` or require a minimum number of filled columns with `thresh=`.'''),
+
+    dict(t='4.17 Turn junk into NULL: nullif and NULL-safe equality', tables=['employees'],
+         code='''employees.select(
+    "emp_id", "phone",
+    F.nullif("phone", F.lit("98765")).alias("phone_fixed"),
+    F.col("manager_id").eqNullSafe(F.lit(None)).alias("no_manager"),
+).show()''',
+         expl='''`nullif(a, b)` returns NULL when `a = b`, otherwise `a` — the standard way to turn a known junk value into NULL.
+
+`eqNullSafe` is SQL's `<=>`: it treats two NULLs as equal and never returns NULL, so it gives true/false for every row.'''),
+
+    dict(divider=True, t='Cleaning = the Silver layer',
+         lead='The functions of this chapter, applied together, turn raw rows into a clean, typed table you can trust.'),
+
+    dict(t='4.18 One cleaning function, written as Silver', tables=['employees'],
+         code='''def to_silver(df):
+    return (df
+        .withColumn("name", F.initcap(F.lower(F.trim(F.regexp_replace("name", r"\\s+", " ")))))
+        .withColumn("email", F.lower(F.trim("email")))
+        .withColumn("dept", F.coalesce("dept", F.lit("Unassigned")))
+        .withColumn("salary", F.round("salary", 2))
+        .withColumn("join_date", F.to_date("join_date", "yyyy-MM-dd"))
+        .withColumn("phone", F.when(F.length("phone") == 10, F.col("phone")))   # invalid → NULL
+        .dropDuplicates(["emp_id"]))
+
+to_silver(employees).write.mode("overwrite").parquet("data/silver/employees")
+
+silver = spark.read.parquet("data/silver/employees")
+silver.printSchema()
+silver.orderBy("emp_id").show(truncate=False)''',
+         expl='''**Silver** is where raw data becomes trustworthy: names fixed, text standardised, real `date` and `double` types, invalid values (the 5-digit phone) turned into NULL, a default for missing departments, and one row per key.
+
+All the rules live in **one function**, so they are easy to read, test (Chapter 14) and re-run on the Bronze data whenever a rule changes. Notice `salary` stays NULL for employee 104: Silver cleans data; it does not invent values that were never recorded.'''),
 ]
 
 POINTS = '''
-1. `df.agg(...)` aggregates the whole table into one row; `df.groupBy(keys).agg(...)` returns one row per group.
-2. Always `alias` aggregates. `count("*")` counts rows; `count(col)`, `sum`, `avg`, `min`, `max` **ignore NULLs**.
-3. WHERE = `filter` **before** `groupBy`; HAVING = `filter` **after** `agg`.
-4. `sum(when(cond, x))` / `count_if(cond)` give several filtered totals in one pass.
+1. All built-ins live in `pyspark.sql.functions` (`F`) and run in the JVM. Look there before writing a UDF.
+2. Strings: `trim`, `lower`, `upper`, `initcap`, `length`, `concat_ws` (skips NULLs), `split(...).getItem(i)`, `substring` (1-based), `lpad`, `regexp_replace`, `regexp_extract`.
+3. Numbers: `round` (half up), `bround` (half even), `floor`, `ceil`; Spark 4 ANSI mode makes division by zero an error — use `try_divide`.
+4. Dates: parse with `to_date(col, "yyyy-MM-dd")` (`MM` = month, `mm` = minute).
 
-    | SQL | PySpark |
+    | Need | Function |
     |---|---|
-    | `GROUP BY a HAVING SUM(x) > 10` | `.groupBy("a").agg(F.sum("x").alias("s")).filter("s > 10")` |
-    | `COUNT(DISTINCT x)` | `F.countDistinct("x")` (exact) / `F.approx_count_distinct("x")` |
-    | `SUM(CASE WHEN c THEN x ELSE 0 END)` | `F.sum(F.when(c, F.col("x")).otherwise(0))` |
-    | `STRING_AGG` / `ARRAY_AGG` | `F.collect_list`, `F.collect_set` |
-    | `GROUP BY ROLLUP(a, b)` | `.rollup("a", "b")` |
-    | `GROUP BY CUBE(a, b)` | `.cube("a", "b")` |
+    | Part of a date | `year`, `month`, `dayofmonth`, `quarter`, `dayofweek` |
+    | Difference | `datediff(end, start)`, `months_between` |
+    | Shift | `date_add`, `date_sub`, `add_months` |
+    | Bucket | `date_trunc("month", c)` (timestamp), `trunc(c, "month")` (date) |
+    | Format as text | `date_format(c, "dd MMM yyyy")` |
 
-5. `pivot(col, [values])` — list the values to save a job; `unpivot` reverses it.
-6. Every `groupBy` is a shuffle; partial aggregation before the shuffle keeps it cheap for sum/count, but not for `collect_list` or exact distinct counts.
+5. `F.when(...).when(...).otherwise(...)` = `CASE WHEN`; first true branch wins; no `otherwise` → NULL.
+6. Test NULL with `isNull()` / `isNotNull()`, never `== None`.
+7. `fillna` / `coalesce` fill, `dropna(subset=, thresh=)` drops, `nullif` creates NULLs, `eqNullSafe` compares NULLs safely.
+8. **Silver** = Bronze after cleaning: one function of trim/case/regex/cast/NULL rules, typed columns, one row per key.
 '''
 
-EXTRA_TITLE = 'Deep dive: how Spark aggregates'
-EXTRA_LEAD = 'Why sum is cheap, countDistinct is expensive, and what the plan shows.'
+EXTRA_TITLE = 'Deep dive: functions that surprise people'
+EXTRA_LEAD = 'Three behaviours that look like bugs until you know the rule.'
 EXTRA = [
-    dict(t='Two-phase aggregation in the plan', tables=['sales'],
-         code='''sales.groupBy("region").agg(F.sum("amount")).explain()''',
-         expl='''Read it bottom-up: `HashAggregate(partial_sum)` sums **inside each partition** first, the `Exchange` shuffles only one row per region per partition, and the top `HashAggregate` adds the partial sums.
+    dict(t='Division by zero: error in ANSI mode, NULL with try_divide', error=True,
+         code='''nums = spark.createDataFrame([(10, 2), (5, 0)], "a INT, b INT")
+nums.select(F.try_divide("a", "b").alias("safe")).show()
+nums.select((F.col("a") / F.col("b")).alias("plain")).show()''',
+         expl='''`try_divide` returns NULL for the row with `b = 0` and the query succeeds. Plain `/` raises `DIVIDE_BY_ZERO` because Spark 4 runs in ANSI mode.
 
-That is why `sum`, `count`, `min`, `max` and `avg` scale well — the shuffle carries partial results, not raw rows (the same idea as a combiner in MapReduce).'''),
-    dict(t='countDistinct needs an extra aggregation', tables=['sales'],
-         code='''sales.groupBy("region").agg(F.countDistinct("product")).explain()''',
-         expl='''An exact distinct count cannot be pre-summed: Spark first groups by `(region, product)` to remove duplicates, then counts per region — more `HashAggregate` steps and a second shuffle.
+Older tutorials say "division by zero returns NULL in Spark" — that was the pre-4.0 default.'''),
+    dict(t='Date patterns: MM is month, mm is minute',
+         code='''raw = spark.createDataFrame([("2024-03-15",)], ["d"])
+raw.select(F.to_date("d", "yyyy-MM-dd").alias("right"),
+           F.date_format(F.to_date("d", "yyyy-MM-dd"), "dd/MM/yyyy").alias("as_text"),
+           F.date_format(F.to_date("d", "yyyy-MM-dd"), "dd/mm/yyyy").alias("wrong")).show()''',
+         expl='''With `mm` the formatter prints **minutes** — `00`, because a date has no time part. Nothing fails; the report is silently wrong. Always use capital `MM` for months.'''),
+    dict(t='Why NULL > 0 is not false',
+         code='''t = spark.createDataFrame([(5,), (None,), (-1,)], "x INT")
+t.select("x", (F.col("x") > 0).alias("x>0"),
+         F.when(F.col("x") > 0, "pos").otherwise("not pos").alias("label")).show()
+print(t.filter(F.col("x") > 0).count(), t.filter(~(F.col("x") > 0)).count())''',
+         expl='''For the NULL row `x > 0` is NULL, so it lands in **neither** the filter nor its negation: 1 + 1 rows out of 3. In `when`, NULL is treated like false and falls to `otherwise`.
 
-With high-cardinality columns this is where jobs slow down. Use `approx_count_distinct` when a small error is acceptable.'''),
-    dict(t='NULL keys form their own group',
-         code='''t = spark.createDataFrame([("A", 1), (None, 2), (None, 3), ("A", 4)], "k STRING, v INT")
-t.groupBy("k").agg(F.sum("v").alias("total"), F.count("k").alias("count_k")).show()''',
-         expl='''All NULL keys are grouped together (as in SQL). But `count("k")` is **0** for that group, because `count(col)` skips NULLs — use `count("*")` to count the rows.'''),
+When a filter and its opposite do not add up to the total row count, a NULL is hiding in the condition.'''),
 ]
 
 MCQS = [
-    dict(q='How do you write `HAVING SUM(amount) > 1000` in PySpark?', kind='concept',
-         o=['`.groupBy("r").having(F.sum("amount") > 1000)`', '`.filter(F.sum("amount") > 1000).groupBy("r")`',
-            '`.groupBy("r").agg(F.sum("amount").alias("s")).filter("s > 1000")`', '`.groupBy("r").where("amount > 1000")`'], a=2,
-         why='There is no having method; filter the aggregated result after agg.'),
-    dict(q='What does this print?', kind='output', run=True, check='[1, 1]',
-         code='''df = spark.createDataFrame([("a", 1), ("a", None), ("b", 5)], "k STRING, v INT")
-r = df.groupBy("k").agg(F.count("v").alias("c")).orderBy("k").collect()
-print([x.c for x in r])''',
-         o=['`[2, 1]`', '`[1, 1]`', '`[2, 0]`', '`[3]`'], a=1,
-         why='`count("v")` skips NULLs: group a has one non-NULL value. (`count("*")` would give 2.)'),
-    dict(q='Why can `countDistinct` be much slower than `sum` on big data?', kind='concept',
-         o=['It runs in Python', 'It cannot be partially aggregated — every distinct value must be kept and shuffled', 'It always uses one partition', 'It sorts the whole table first'], a=1,
-         why='Sums can be pre-aggregated per partition; distinct values must be deduplicated across all partitions, which needs extra aggregation and shuffling.'),
-    dict(q='`df.rollup("region", "category")` — what does a row with region = NULL and category = NULL hold?', kind='concept',
-         o=['Rows whose region and category are missing', 'The grand total over all rows', 'Nothing — rollup drops NULLs', 'The average of all groups'], a=1,
-         why='In rollup output, NULL in a key column means "all values" — both NULL is the grand total. Use `grouping_id()` to tell this apart from real NULL data.'),
-    dict(q='What does this print?', kind='output', run=True, check='2.0',
-         code='''df = spark.createDataFrame([(1,), (None,), (3,)], "x INT")
-print(df.agg(F.avg("x")).first()[0])''',
-         o=['1.33', '2.0', 'None', '1.0'], a=1,
-         why='avg ignores NULLs: (1 + 3) / 2 = 2.0.'),
-    dict(q='Why pass the value list in `pivot("category", ["A", "B"])`?', kind='concept',
-         o=['Without it, pivot fails', 'It avoids an extra job that finds the distinct values first, and fixes the column order', 'It makes the result sorted', 'It removes NULL values'], a=1,
-         why='Without the list, Spark must first compute the distinct values of the pivot column — an extra pass over the data.'),
-    dict(q='The output has a column named `sum(amount)` instead of `revenue`. What is missing?', kind='debug',
-         code='''sales.groupBy("region").agg(F.sum("amount"))''',
-         o=['`.alias("revenue")` on the aggregate', 'An `orderBy`', '`F.col("revenue")`', 'A `select` before `groupBy`'], a=0,
-         why='Unnamed aggregates get generated names. `F.sum("amount").alias("revenue")` names it.'),
-    dict(q='Which gives the number of orders with amount ≥ 5000 per region in one pass?', kind='concept',
-         o=['`.groupBy("region").count_if("amount >= 5000")`', '`.groupBy("region").agg(F.count_if(F.col("amount") >= 5000))`', '`.filter("amount >= 5000").count()`', '`.agg(F.when(F.count("*") >= 5000))`'], a=1,
-         why='`count_if(condition)` is an aggregate that counts rows where the condition is true.'),
-    dict(q='What does this print?', kind='output', run=True, check="['x', 'y']",
-         code='''df = spark.createDataFrame([("g", "y"), ("g", "x"), ("g", "y")], "k STRING, v STRING")
-print(df.groupBy("k").agg(F.array_sort(F.collect_set("v")).alias("s")).first().s)''',
-         o=["`['y', 'x', 'y']`", "`['x', 'y']`", "`['y', 'x']`", '`2`'], a=1,
-         why='collect_set removes the duplicate y, and array_sort orders the result.'),
+    dict(q='What does this print?', kind='output', run=True, check='a-c',
+         code='''df = spark.createDataFrame([("a", None, "c")], "x STRING, y STRING, z STRING")
+print(df.select(F.concat_ws("-", "x", "y", "z")).first()[0])''',
+         o=['`None`', '`a--c`', '`a-c`', '`a-None-c`'], a=2,
+         why='`concat_ws` skips NULL values entirely, so only `a` and `c` are joined. `concat` would have returned NULL.'),
+    dict(q='Which pattern parses the text `"07/03/2025"` as 7 March 2025?', kind='concept',
+         o=['`"mm/dd/yyyy"`', '`"dd/MM/yyyy"`', '`"dd/mm/yyyy"`', '`"MM/dd/yyyy"`'], a=1,
+         why='Day first, then month: `dd/MM/yyyy`. Lower-case `mm` means minutes.'),
+    dict(q='What does this print?', kind='output', run=True, check='2',
+         code='''df = spark.createDataFrame([(2.5,)], ["v"])
+print(int(df.select(F.bround("v", 0)).first()[0]))''',
+         o=['2', '3', '2.5', 'It raises an error'], a=0,
+         why='`bround` uses banker\'s rounding (half to even): 2.5 → 2. `round` would give 3.'),
+    dict(q='The filter below returns 0 rows although some phones are missing. Why?', kind='debug',
+         code='''print(employees.filter(F.col("phone") == None).count())''',
+         o=['`== None` compares with NULL, which is never true; use `isNull()`', 'Phones are strings, so you must write `== "None"`', 'filter cannot take None', 'count() ignores NULL rows'], a=0,
+         why='Any comparison with NULL yields NULL, and filter keeps only true rows. Use `F.col("phone").isNull()`.'),
+    dict(q='A `when` chain has no `.otherwise()`. What do rows that match no condition get?', kind='concept',
+         o=['An empty string', 'The value of the last `when`', 'NULL', 'An error is raised'], a=2,
+         why='Like SQL CASE without ELSE, unmatched rows get NULL.'),
+    dict(q='What does this print?', kind='output', run=True, check='2025-02-28',
+         code='''df = spark.createDataFrame([("2024-02-29",)], ["d"])
+print(df.select(F.add_months(F.to_date("d"), 12)).first()[0])''',
+         o=['2025-02-29', '2025-03-01', '2025-02-28', 'None'], a=2,
+         why='add_months keeps the day where possible and clamps to the last day of the target month; February 2025 ends on the 28th.'),
+    dict(q='`F.split("email", "@").getItem(1)` on `"sara@tcs.co.in"` returns:', kind='concept',
+         o=['`sara`', '`tcs.co.in`', '`["sara", "tcs.co.in"]`', '`tcs`'], a=1,
+         why='split returns an array `["sara", "tcs.co.in"]`; getItem is 0-based, so item 1 is the domain.'),
+    dict(q='How many rows survive `dropna()` on a DataFrame where every row has at least one NULL?', kind='concept',
+         o=['All of them', 'None', 'Half of them', 'It depends on the number of partitions'], a=1,
+         why='Default `how="any"` drops a row if any column is NULL. Use `subset` or `thresh` to be less strict.'),
+    dict(q='The code below fails in Spark 4. What is the most likely fix?', kind='debug',
+         code='''df.select(F.col("revenue") / F.col("orders"))''',
+         o=['Cast both columns to string', 'Use `F.try_divide("revenue", "orders")` because some orders are 0', 'Use `//` instead of `/`', 'Wrap it in `F.lit`'], a=1,
+         why='ANSI mode raises DIVIDE_BY_ZERO; `try_divide` returns NULL for those rows instead.'),
+    dict(q='Which function returns the **first non-NULL** value from several columns?', kind='concept',
+         o=['`F.nullif`', '`F.coalesce`', '`F.first`', '`F.nvl2`'], a=1,
+         why='coalesce(a, b, c) returns a if not NULL, else b, else c.'),
 ]
 
 PRACTICE = dict(
-    kinds=['Rewrite GROUP BY / HAVING reports from your SQL notes, including conditional sums.',
-           'Monthly and region × category summaries, then the same as a pivot table.',
-           'Subtotal reports with rollup, and grouping_id to label subtotal rows.'],
+    kinds=['Clean a text column end to end: trim, collapse spaces, fix case, validate length.',
+           'Parse text dates, then compute age in days and years, and bucket by month.',
+           'Profile a new dataset: NULL count per column, then decide fill vs drop per column.'],
     problems=[
-        (1693, 'daily-leads-and-partners', 'Daily Leads and Partners', 'Easy', 'groupBy two keys + two `countDistinct`.'),
-        (596, 'classes-more-than-5-students', 'Classes More Than 5 Students', 'Easy', 'HAVING = filter after agg.'),
-        (1211, 'queries-quality-and-percentage', 'Queries Quality and Percentage', 'Easy', '`avg` of a ratio and `avg(when(...))`.'),
-        (1193, 'monthly-transactions-i', 'Monthly Transactions I', 'Medium', '`date_format` month key + conditional sums.'),
-        (1907, 'count-salary-categories', 'Count Salary Categories', 'Medium', 'Conditional counts, then unpivot to rows.'),
+        (1667, 'fix-names-in-a-table', 'Fix Names in a Table', 'Easy', '`upper` + `lower` + `substring` (or `initcap`).'),
+        (1484, 'group-sold-products-by-the-date', 'Group Sold Products By The Date', 'Easy', '`collect_set`, `array_sort`, `concat_ws`.'),
+        (1873, 'calculate-special-bonus', 'Calculate Special Bonus', 'Easy', '`when` with `%` and `startswith`.'),
+        (1141, 'user-activity-for-the-past-30-days-i', 'User Activity for the Past 30 Days I', 'Easy', '`date_sub` / `datediff` in a filter, then count distinct.'),
+        (197, 'rising-temperature', 'Rising Temperature', 'Easy', '`date_add` in a self-join condition (or `lag`).'),
     ])

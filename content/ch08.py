@@ -1,201 +1,229 @@
 ORDER = 8
 KEY = '8'
-TITLE = 'Spark SQL: views, the catalog and mixing SQL with Python'
+TITLE = 'Complex Types: Arrays, Maps, Structs and JSON'
 WEEK = 'Week 4'
-DATA = ['students', 'marks']
+DATA = ['orders', 'events']
 
-SETUP_TITLE = '8.0 The data — and a view for SQL'
+SETUP_TITLE = '8.0 The data — nested, like real JSON'
 SETUP = '''from pyspark.sql import functions as F
 
-students = spark.createDataFrame([
-    (1, "Amit", "CSE", "Pune"), (2, "Riya", "ECE", "Mumbai"), (3, "Arjun", "CSE", "Delhi"),
-    (4, "Sneha", "ME", "Pune"), (5, "Ankit", "CSE", "Kolkata"), (6, "Neha", "ECE", "Pune"),
-], "student_id INT, name STRING, branch STRING, city STRING")
+orders = spark.createDataFrame([
+    (1, ("Amit", "Pune", "411001"),   ["phone", "case"],          {"coupon": "NEW10", "channel": "app"}),
+    (2, ("Riya", "Mumbai", "400001"), ["laptop"],                 {"channel": "web"}),
+    (3, ("Arjun", "Delhi", None),     [],                         {}),
+    (4, ("Sneha", "Pune", "411014"),  ["case", "charger", "case"], None),
+], "order_id INT, customer STRUCT<name: STRING, city: STRING, pin: STRING>, "
+   "items ARRAY<STRING>, meta MAP<STRING, STRING>")
 
-marks = spark.createDataFrame([
-    (1, "DBMS", 85), (1, "OS", 78), (2, "DBMS", 72), (2, "OS", 91), (3, "DBMS", 95),
-    (3, "OS", 88), (4, "DBMS", 58), (5, "OS", 66), (6, "DBMS", 81), (6, "OS", 74),
-], "student_id INT, subject STRING, score INT")
+events = spark.createDataFrame([
+    (1, '{"user": "u1", "action": "click", "device": {"os": "android", "ver": 14}}'),
+    (2, '{"user": "u2", "action": "buy", "amount": 499, "device": {"os": "ios", "ver": 17}}'),
+    (3, '{"user": "u1", "action": "view"}'),
+], "id INT, payload STRING")'''
+SETUP_EXPL = '''Spark columns can hold more than single values:
 
-students.createOrReplaceTempView("students")
-marks.createOrReplaceTempView("marks")'''
-SETUP_EXPL = '''`createOrReplaceTempView(name)` registers a DataFrame under a name that SQL can use. Nothing is copied or computed — a view is just a name for the DataFrame's plan.
+- **STRUCT** — a fixed set of named fields (`customer.name`), like a nested JSON object.
+- **ARRAY** — a list of values of one type (`items`).
+- **MAP** — key → value pairs whose keys vary per row (`meta`).
 
-A temporary view lives as long as this SparkSession and is visible only to it.'''
+`events.payload` holds raw JSON **text**, as it arrives from Kafka or an API log; this chapter parses it.'''
 
 SECTIONS = [
-    dict(t='8.1 Run SQL and get a DataFrame back', tables=['students'], home=True,
-         code='''top = spark.sql("""
-    SELECT s.name, s.branch, ROUND(AVG(m.score), 1) AS avg_score
-    FROM students s JOIN marks m ON s.student_id = m.student_id
-    GROUP BY s.name, s.branch
-    ORDER BY avg_score DESC
-""")
-top.show()
-print(type(top))''',
-         expl='''`spark.sql(query)` returns an ordinary **DataFrame**. It is lazy like any other — `show()` runs it.
+    dict(t='8.1 Look at nested data', tables=['orders'],
+         code='''orders.printSchema()
+orders.show(truncate=False)''',
+         expl='''`printSchema` draws the nesting as a tree. `show` prints a struct as `{Amit, Pune, 411001}`, an array as `[phone, case]` and a map as `{coupon -> NEW10, …}`.
 
-SQL and the DataFrame API compile to the **same plan** through the same optimiser, so there is no speed difference. Choose whichever reads better for the task.'''),
+Note the difference between an **empty** array `[]` (order 3 has no items) and a **NULL** map (order 4 has no metadata at all).'''),
 
-    dict(t='8.2 Mix both: SQL for the query, Python for the rest', tables=['students', 'marks'],
-         code='''dbms = spark.sql("SELECT student_id, score FROM marks WHERE subject = 'DBMS'")
+    dict(t='8.2 Read struct fields: dot notation and select("struct.*")', tables=['orders'],
+         code='''orders.select("order_id", "customer.name", F.col("customer.city").alias("city")).show()
 
-result = (dbms.join(students, "student_id")
-              .withColumn("grade", F.when(F.col("score") >= 80, "A").otherwise("B"))
-              .orderBy(F.desc("score")))
-result.select("name", "score", "grade").show()''',
-         expl='''Because `spark.sql` returns a DataFrame, you can keep transforming it with Python methods — and register any DataFrame as a view to continue in SQL. Teams often write the business logic in SQL and the plumbing (reading, writing, loops over dates) in Python.'''),
+orders.select("order_id", "customer.*").show()''',
+         expl='''`"customer.name"` or `F.col("customer.city")` reach inside a struct. `"customer.*"` flattens **all** its fields into top-level columns — the quickest way to un-nest one level.
 
-    dict(t='8.3 CTEs and subqueries work as in PostgreSQL', tables=['students', 'marks'],
-         code='''spark.sql("""
-    WITH avg_by_subject AS (
-        SELECT subject, AVG(score) AS subj_avg FROM marks GROUP BY subject
-    )
-    SELECT s.name, m.subject, m.score, ROUND(a.subj_avg, 1) AS subj_avg
-    FROM marks m
-    JOIN avg_by_subject a ON m.subject = a.subject
-    JOIN students s ON s.student_id = m.student_id
-    WHERE m.score > a.subj_avg
-    ORDER BY m.subject, m.score DESC
-""").show()''',
-         expl='''`WITH` (CTE), subqueries in `WHERE` / `FROM`, `EXISTS`, `IN`, window functions and `CASE WHEN` all work. Spark SQL follows ANSI SQL closely, so most of your PostgreSQL queries run unchanged.
+Reading one field of a struct in a Parquet file reads only that field from disk (nested column pruning).'''),
 
-This query lists every score above its subject's average.'''),
-
-    dict(t='8.4 Window functions in SQL', tables=['marks'],
-         code='''spark.sql("""
-    SELECT * FROM (
-        SELECT student_id, subject, score,
-               DENSE_RANK() OVER (PARTITION BY subject ORDER BY score DESC) AS rnk
-        FROM marks
-    ) WHERE rnk <= 2
-    ORDER BY subject, rnk
-""").show()''',
-         expl='''The same top-N-per-group pattern as Chapter 7, in SQL: rank inside a subquery, filter outside it. Many people find window functions easier to read in SQL.'''),
-
-    dict(t='8.5 Pass values safely: named parameters', tables=['marks'],
-         code='''spark.sql(
-    "SELECT student_id, score FROM marks WHERE subject = :subj AND score >= :min_score",
-    args={"subj": "OS", "min_score": 75},
+    dict(t='8.3 Inspect arrays: size, array_contains, element_at', tables=['orders'],
+         code='''orders.select(
+    "order_id", "items",
+    F.size("items").alias("n_items"),
+    F.array_contains("items", "case").alias("has_case"),
+    F.try_element_at("items", F.lit(1)).alias("first_item"),
+    F.get("items", 0).alias("get_0"),
 ).show()''',
-         expl='''`args={...}` binds values to `:name` markers (Spark 3.4+). The values are passed as data, never pasted into the SQL text, so a value like `"OS' OR 1=1 --"` cannot change the query — the same reason you use parameters in PostgreSQL drivers.
+         expl='''`size` counts elements (0 for an empty array). `array_contains` tests membership. `element_at(col, 1)` takes the first element — **1-based**, negative positions count from the end — while `col[0]` / `getItem(0)` is 0-based.
 
-Never build SQL with f-strings from user input.'''),
+Order 3 has no items. In Spark 4 (ANSI mode) `element_at` past the end **raises an error**, so this uses `try_element_at`, which returns NULL. For 0-based access, `items[0]` also fails on an empty array; `F.get(col, 0)` returns NULL instead.'''),
 
-    dict(t='8.6 Reference a DataFrame without a view', tables=['students'],
-         code='''pune = students.filter(F.col("city") == "Pune")
+    dict(t='8.4 One row per item: explode', tables=['orders'], home=True,
+         code='''(orders.select("order_id", F.explode("items").alias("item"))
+       .show())''',
+         expl='''`explode` turns each array element into its own row and repeats the other columns. Order 1 becomes two rows, order 4 three.
 
-spark.sql("SELECT branch, COUNT(*) AS n FROM {df} GROUP BY branch ORDER BY branch",
-          df=pune).show()''',
-         expl='''Keyword arguments to `spark.sql` that are DataFrames can be referenced as `{name}` in the query (Spark 3.3+). Spark registers them for this one query — no temp views left behind.'''),
+Order 3 **disappears**: an empty (or NULL) array produces no rows. If every order must stay in the result, use `explode_outer` (next slide).'''),
 
-    dict(t='8.7 What is in the catalog?',
-         code='''for t in spark.catalog.listTables():
-    print(t.name, t.tableType, t.isTemporary)
+    dict(t='8.5 Keep the empty orders: explode_outer and posexplode', tables=['orders'],
+         code='''orders.select("order_id", F.explode_outer("items").alias("item")).show()
 
-print(spark.catalog.currentDatabase())
-spark.sql("SHOW TABLES").show()''',
-         expl='''`spark.catalog` lists databases, tables, views and functions. Our two views appear as `TEMPORARY`.
+orders.select("order_id", F.posexplode("items").alias("pos", "item")) \\
+      .filter("order_id = 4").show()''',
+         expl='''`explode_outer` keeps rows with an empty or NULL array and gives them a NULL item — the LEFT JOIN of exploding.
 
-The **catalog** (also called the metastore) stores table names, schemas and file locations. Locally Spark uses an in-memory catalog; on a cluster it is usually a Hive Metastore, AWS Glue or Unity Catalog.'''),
+`posexplode` also returns each element's position (0-based), useful when order inside the array matters ("the first item added to the cart").'''),
 
-    dict(t='8.8 A permanent table: saveAsTable', tables=['marks'],
-         code='''marks.write.mode("overwrite").saveAsTable("marks_table")
+    dict(t='8.6 Clean arrays without exploding', tables=['orders'],
+         code='''orders.select(
+    "order_id",
+    F.array_distinct("items").alias("distinct_items"),
+    F.sort_array("items").alias("sorted"),
+    F.array_union("items", F.array(F.lit("bag"))).alias("plus_bag"),
+    F.array_join("items", ", ").alias("as_text"),
+).show(truncate=False)''',
+         expl='''Array functions work on each array in place, so there is no shuffle and no change in the row count: `array_distinct`, `sort_array`, `array_union` / `array_intersect` / `array_except`, `array_join`, `slice`, `flatten`, `arrays_zip`.
 
-spark.sql("DESCRIBE TABLE marks_table").show()
-print(spark.table("marks_table").count())''',
-         expl='''`saveAsTable` writes the data as files (Parquet by default) into the **warehouse directory** (`spark-warehouse/` locally) and registers it in the catalog. Unlike a temp view, the data itself is stored and outlives the session.
+`F.array(...)` builds an array from columns or literals.'''),
 
-`spark.table(name)` reads a table or view back as a DataFrame.'''),
+    dict(t='8.7 Transform every element: transform, filter, aggregate', tables=['orders'],
+         code='''orders.select(
+    "order_id",
+    F.transform("items", lambda x: F.upper(x)).alias("upper"),
+    F.filter("items", lambda x: x != "case").alias("no_case"),
+    F.aggregate("items", F.lit(0), lambda acc, x: acc + F.length(x)).alias("total_chars"),
+).show(truncate=False)''',
+         expl='''These are **higher-order functions**. The Python `lambda` here is **not** run in Python: it is translated once into a Spark expression and runs in the JVM for every element. So it is as fast as any built-in — very different from a UDF.
 
-    dict(t='8.9 Global temp views are shared across sessions',
-         code='''students.createOrReplaceGlobalTempView("students_g")
+`aggregate(array, start, merge)` folds an array into one value, like Python's `functools.reduce`.'''),
 
-other = spark.newSession()
-print(other.sql("SELECT COUNT(*) FROM global_temp.students_g").first()[0])
-print([t.name for t in other.catalog.listTables()])''',
-         expl='''A **global** temp view lives in the special `global_temp` database and is visible to every session of the same Spark application. A normal temp view is not: the new session sees only the permanent `marks_table` from the previous slide, not the `students` and `marks` temp views.'''),
+    dict(t='8.8 Read a map: keys, values and one key', tables=['orders'],
+         code='''orders.select(
+    "order_id",
+    F.map_keys("meta").alias("keys"),
+    F.col("meta")["channel"].alias("channel"),
+    F.element_at("meta", "coupon").alias("coupon"),
+).show(truncate=False)''',
+         expl='''`meta["channel"]` or `element_at(meta, "channel")` looks up one key; a missing key gives NULL. `map_keys` / `map_values` return arrays.
 
-    dict(t='8.10 SQL functions on arrays: higher-order functions',
-         code='''spark.sql("""
-    SELECT student_id,
-           collect_list(score) AS scores,
-           aggregate(collect_list(score), 0, (acc, x) -> acc + x) AS total,
-           filter(collect_list(score), x -> x >= 80) AS high
-    FROM marks GROUP BY student_id ORDER BY student_id
-""").show()''',
-         expl='''Spark SQL has lambdas written as `x -> expression`: `transform`, `filter`, `exists`, `aggregate`. They are the SQL form of the higher-order functions from Chapter 5 and run in the JVM.'''),
+Use a **map** when keys differ from row to row (tags, attributes) and a **struct** when every row has the same fields — structs are typed per field and store more efficiently.'''),
+
+    dict(t='8.9 Explode a map into key/value rows', tables=['orders'],
+         code='''orders.select("order_id", F.explode("meta").alias("key", "value")).show()''',
+         expl='''Exploding a map returns two columns, key and value — one row per entry. Order 3 (empty map) and order 4 (NULL map) produce no rows, exactly as with arrays.'''),
+
+    dict(t='8.10 Parse JSON text into columns: from_json', tables=['events'],
+         code='''schema = "user STRING, action STRING, amount INT, device STRUCT<os: STRING, ver: INT>"
+
+parsed = events.withColumn("e", F.from_json("payload", schema))
+parsed.select("id", "e.user", "e.action", "e.amount", "e.device.os").show()''',
+         expl='''`from_json(col, schema)` parses a JSON string into a struct using the schema you give — a DDL string works. Fields missing from a document (`amount`, `device` in event 3) become NULL; extra fields in the JSON are ignored.
+
+Always give the schema. `schema_of_json` can suggest one from a sample, but inferring it per row would be slow and unstable.'''),
+
+    dict(t='8.11 Pull a single value without a schema: get_json_object', tables=['events'],
+         code='''events.select(
+    "id",
+    F.get_json_object("payload", "$.action").alias("action"),
+    F.get_json_object("payload", "$.device.os").alias("os"),
+).show()''',
+         expl='''`get_json_object(col, "$.path")` extracts one value by a JSONPath and always returns a **string**. Good for one or two fields; for many fields `from_json` is faster because it parses each document once.'''),
+
+    dict(t='8.12 Build nested output: struct, to_json and collect_list', tables=['orders'],
+         code='''flat = orders.select("customer.city", "customer.name", "order_id")
+
+nested = (flat.groupBy("city")
+              .agg(F.collect_list(F.struct("order_id", "name")).alias("orders")))
+nested.select("city", F.to_json("orders").alias("json")).show(truncate=False)''',
+         expl='''`F.struct(...)` packs columns into one struct column; `collect_list` of structs builds an array of objects per group; `to_json` turns any struct, array or map into JSON text.
+
+This is the reverse of `explode` and how you produce nested JSON for an API or a document store.'''),
 ]
 
 POINTS = '''
-1. `df.createOrReplaceTempView("name")` → query it with `spark.sql("…")`. Views store no data.
-2. `spark.sql` returns a DataFrame — chain Python methods on it, or register results as new views.
-3. SQL and the DataFrame API produce the **same plan**: choose by readability, not speed.
-4. Use parameters: `spark.sql("… WHERE x = :v", args={"v": 5})`. Never f-string user input into SQL.
-5. `spark.sql("SELECT … FROM {df}", df=my_df)` uses a DataFrame without creating a view.
+1. Three complex types: **STRUCT** (fixed named fields), **ARRAY** (list of one type), **MAP** (varying keys).
+2. Struct fields: `"s.field"`, `F.col("s.field")`, or `select("s.*")` to flatten one level.
+3. Arrays: `size`, `array_contains`, `element_at` (1-based) vs `getItem` (0-based), `array_distinct`, `sort_array`, `array_join`.
+4. `explode` drops rows with empty/NULL arrays; `explode_outer` keeps them; `posexplode` adds the position.
+5. Higher-order functions `transform`, `filter`, `aggregate`, `exists` run in the JVM — the lambda is not Python at run time.
+6. JSON: `from_json(col, schema)` for many fields, `get_json_object(col, "$.path")` for one, `to_json` to write JSON.
+7. Re-nest with `F.struct` + `collect_list` — the inverse of `explode`.
 
-    | Object | Lives | Visible to | Stores data? |
-    |---|---|---|---|
-    | Temp view | Session | That session | No |
-    | Global temp view (`global_temp.x`) | Application | All sessions | No |
-    | Table (`saveAsTable`) | Until dropped | Everyone using the catalog | Yes (files) |
-
-6. `spark.catalog` / `SHOW TABLES` / `DESCRIBE TABLE` inspect the metastore.
+    | Need | Function |
+    |---|---|
+    | Array → rows | `explode`, `explode_outer`, `posexplode` |
+    | Rows → array | `collect_list`, `collect_set` |
+    | Text → struct | `from_json` |
+    | Struct → text | `to_json` |
 '''
 
-EXTRA_TITLE = 'Deep dive: one optimiser for both languages'
-EXTRA_LEAD = 'Proof that SQL and Python end up as the same plan.'
+EXTRA_TITLE = 'Deep dive: nested data in practice'
+EXTRA_LEAD = 'The traps that appear when you flatten real JSON.'
 EXTRA = [
-    dict(t='Same query, same physical plan', tables=['marks'],
-         code='''q_sql = spark.sql("SELECT subject, AVG(score) AS a FROM marks WHERE score > 70 GROUP BY subject")
-q_df = marks.filter("score > 70").groupBy("subject").agg(F.avg("score").alias("a"))
+    dict(t='Exploding two arrays multiplies the rows',
+         code='''t = spark.createDataFrame([(1, ["a", "b"], [10, 20])], "id INT, xs ARRAY<STRING>, ys ARRAY<INT>")
 
-q_sql.explain()
-q_df.explain()''',
-         expl='''Both print the same operators — Filter → partial HashAggregate → Exchange → final HashAggregate — down to the column IDs (`#5`, `#6`). Only the internal `plan_id` differs.
+print(t.withColumn("x", F.explode("xs")).withColumn("y", F.explode("ys")).count())
 
-Catalyst parses SQL into the same logical plan a DataFrame builds, then optimises both identically.'''),
-    dict(t='The four stages Catalyst goes through', tables=['marks'],
-         code='''spark.sql("SELECT subject, score * 2 AS s2 FROM marks WHERE score > 80 AND 1 = 1").explain("extended")''',
-         expl='''`explain("extended")` shows each step: the **parsed** plan (names not yet checked), the **analyzed** plan (names resolved against the catalog, types known), the **optimized** plan (rules applied — the useless `1 = 1` is gone and filters are pushed down), and the **physical** plan (the operators that actually run).'''),
+t.select("id", F.explode(F.arrays_zip("xs", "ys")).alias("z")) \\
+ .select("id", "z.xs", "z.ys").show()''',
+         expl='''Two explodes in a row build a **cross product**: 2 × 2 = 4 rows, pairing every x with every y. When the arrays are parallel (element i of one belongs with element i of the other), `arrays_zip` them first and explode once.'''),
+    dict(t='Malformed JSON becomes NULL, not an error',
+         code='''bad = spark.createDataFrame([('{"user": "u9", "action": "click"}',), ('{"user": "u10", action}',)], ["payload"])
+bad.select(F.from_json("payload", "user STRING, action STRING").alias("e")).show()''',
+         expl='''With the default `PERMISSIVE` mode a document that cannot be parsed returns a struct of NULLs instead of failing the job. Count those rows after parsing; silent data loss is the usual result of a schema mismatch.'''),
+    dict(t='Flatten every struct automatically',
+         code='''def flatten(df):
+    from pyspark.sql.types import StructType
+    cols = []
+    for f in df.schema.fields:
+        if isinstance(f.dataType, StructType):
+            cols += [F.col(f"{f.name}.{c.name}").alias(f"{f.name}_{c.name}") for c in f.dataType.fields]
+        else:
+            cols.append(F.col(f.name))
+    return df.select(cols)
+
+print(flatten(orders).columns)''',
+         expl='''The schema is ordinary Python data (`df.schema.fields`), so you can write helpers that walk it. This one flattens one level of structs with prefixed names; call it again for deeper nesting.'''),
 ]
 
 MCQS = [
-    dict(q='What does `spark.sql("SELECT …")` return?', kind='concept',
-         o=['A list of Row objects', 'A pandas DataFrame', 'A Spark DataFrame (lazy)', 'The number of rows'], a=2,
-         why='spark.sql returns a lazy DataFrame; an action such as show or collect runs it.'),
-    dict(q='Which is faster: the SQL version of a query or the DataFrame API version?', kind='concept',
-         o=['SQL, because it is compiled', 'The DataFrame API, because it is Python', 'Neither — both go through Catalyst to the same plan', 'It depends on the number of columns'], a=2,
-         why='Both are optimised by Catalyst into the same physical plan.'),
-    dict(q='A temp view was created in one session. Another session (`spark.newSession()`) queries it. What happens?', kind='concept',
-         o=['It works', 'It fails: temp views are visible only to the session that created them', 'It returns an empty result', 'It copies the data'], a=1,
-         why='Temp views are session-scoped. Use a global temp view (global_temp.name) to share within the application.'),
-    dict(q='What does this print?', kind='output', run=True, check='2',
-         code='''spark.createDataFrame([(1,), (2,), (3,)], "x INT").createOrReplaceTempView("t")
-print(spark.sql("SELECT COUNT(*) FROM t WHERE x > :v", args={"v": 1}).first()[0])''',
-         o=['1', '2', '3', '0'], a=1,
-         why='The parameter v = 1 is bound safely; two rows have x > 1.'),
-    dict(q='Why is this code dangerous?', kind='debug',
-         code='''city = request.args["city"]
-spark.sql(f"SELECT * FROM customers WHERE city = '{city}'")''',
-         o=['f-strings are slow', 'User input pasted into SQL allows SQL injection — use args={...} parameters', 'spark.sql cannot use quotes', 'city must be upper case'], a=1,
-         why='A value like `x\' OR \'1\'=\'1` changes the query. Bind values with named parameters instead.'),
-    dict(q='Where does `saveAsTable("t")` store the data when running locally with default settings?', kind='concept',
-         o=['Only in memory', 'In the spark-warehouse directory as Parquet files', 'In PostgreSQL', 'It does not store data'], a=1,
-         why='saveAsTable writes files to the warehouse directory (spark-warehouse by default) and registers the table in the catalog.'),
-    dict(q='In `explain("extended")`, which plan has the redundant `AND 1 = 1` removed?', kind='concept',
-         o=['Parsed logical plan', 'Analyzed logical plan', 'Optimized logical plan', 'None — Spark keeps it'], a=2,
-         why='Optimisation rules such as constant folding and boolean simplification run on the optimized logical plan.'),
+    dict(q='What does this print?', kind='output', run=True, check='3',
+         code='''df = spark.createDataFrame([(1, ["a", "b"]), (2, []), (3, ["c"])], "id INT, xs ARRAY<STRING>")
+print(df.select(F.explode("xs")).count())''',
+         o=['2', '3', '4', '5'], a=1,
+         why='explode creates one row per element: 2 + 0 + 1 = 3. The empty array produces no rows.'),
+    dict(q='Which function keeps a row whose array is empty, with a NULL element?', kind='concept',
+         o=['`explode`', '`posexplode`', '`explode_outer`', '`flatten`'], a=2,
+         why='explode_outer emits one row with NULL for an empty or NULL array.'),
+    dict(q='What does this print?', kind='output', run=True, check='a',
+         code='''df = spark.createDataFrame([(["a", "b", "c"],)], "xs ARRAY<STRING>")
+print(df.select(F.element_at("xs", 1)).first()[0])''',
+         o=['`a`', '`b`', '`None`', 'It raises an error'], a=0,
+         why='element_at is 1-based, so position 1 is the first element. `getItem(1)` would return `b`.'),
+    dict(q='Why is `F.transform("items", lambda x: F.upper(x))` fast, unlike a Python UDF?', kind='concept',
+         o=['It runs on the GPU', 'The lambda is translated into a Spark expression once and runs in the JVM', 'It caches the result', 'It skips NULL values'], a=1,
+         why='Higher-order function lambdas build Column expressions; no Python code runs per element.'),
+    dict(q='You need 15 fields from a JSON string column. Which is best?', kind='concept',
+         o=['15 calls to `get_json_object`', 'One `from_json` with a schema, then select the fields', 'A Python UDF with `json.loads`', '`split` on commas'], a=1,
+         why='from_json parses each document once into a typed struct; get_json_object would parse it 15 times and return only strings.'),
+    dict(q='What does this print?', kind='output', run=True, check='4',
+         code='''df = spark.createDataFrame([(["a", "b"], [1, 2])], "xs ARRAY<STRING>, ys ARRAY<INT>")
+print(df.withColumn("x", F.explode("xs")).withColumn("y", F.explode("ys")).count())''',
+         o=['2', '4', '1', '3'], a=1,
+         why='Two explodes create a cross product: 2 × 2 = 4 rows. Use arrays_zip to pair elements.'),
+    dict(q='This select fails with an error. What is wrong?', kind='debug', run=True, error=True,
+         code='''orders.select(F.col("customer").name).show()''',
+         o=['Struct fields need `"customer.name"` or `F.col("customer.name")` — `.name` is the Column method `name()`', 'Structs cannot be selected', 'name is a reserved word in Spark SQL', 'show() does not work on structs'], a=0,
+         why='`Column.name` is a method (an alias of `alias`), so `F.col("customer").name` is not a field access. Use `F.col("customer.name")` or `F.col("customer")["name"]`.'),
+    dict(q='When should you prefer a MAP column over a STRUCT?', kind='concept',
+         o=['When every row has the same fields', 'When the set of keys varies from row to row', 'When values have different types', 'Never — maps are deprecated'], a=1,
+         why='Maps suit dynamic keys (tags, attributes). Structs are better for a fixed set of typed fields.'),
 ]
 
 PRACTICE = dict(
-    kinds=['Run your existing PostgreSQL practice queries unchanged with spark.sql, and note any that fail.',
-           'Write each answer twice — SQL and DataFrame API — and compare the plans with explain().',
-           'Parameterise every filter value with args={...}.'],
+    kinds=['Parse a JSON log column with `from_json`, flatten it, and count events per type.',
+           'Explode an order\'s items, aggregate per product, then rebuild nested JSON with `collect_list(struct)`.',
+           'Clean arrays in place with `transform`, `filter` and `array_distinct` — no explode.'],
     problems=[
-        (1068, 'product-sales-analysis-i', 'Product Sales Analysis I', 'Easy', 'Plain SQL join through a temp view.'),
-        (1075, 'project-employees-i', 'Project Employees I', 'Easy', 'Join + GROUP BY + ROUND(AVG).'),
-        (1251, 'average-selling-price', 'Average Selling Price', 'Easy', 'Range join on dates, weighted average.'),
-        (1633, 'percentage-of-users-attended-a-contest', 'Percentage of Users Attended a Contest', 'Easy', 'Scalar subquery for the total.'),
-        (1164, 'product-price-at-a-given-date', 'Product Price at a Given Date', 'Medium', 'CTE + window function in SQL.'),
+        (1484, 'group-sold-products-by-the-date', 'Group Sold Products By The Date', 'Easy', '`collect_set` → `array_sort` → `array_join`.'),
+        (2356, 'number-of-unique-subjects-taught-by-each-teacher', 'Number of Unique Subjects Taught by Each Teacher', 'Easy', 'Compare `countDistinct` with `size(collect_set(...))`.'),
     ])

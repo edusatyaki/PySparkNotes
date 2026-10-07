@@ -1,249 +1,330 @@
 ORDER = 12
 KEY = '12'
-TITLE = 'Structured Streaming: files, windows, watermarks, foreachBatch'
+TITLE = 'Delta Lake and the Medallion Architecture: MERGE, SCD2, incremental loads'
+DELTA = True     # run on a Spark session with Delta Lake
 WEEK = 'Week 6'
-DATA = ['data/stream/in/*.json']
+DATA = ['customers (Delta)', 'dim_customer (SCD2)', 'orders_source']
 
-SETUP_TITLE = '12.0 A folder that receives new files'
-SETUP = '''import json, os, shutil
-from pyspark.sql import functions as F
+SETUP_TITLE = '12.0 A Spark session with Delta Lake'
+SETUP = '''# pip install delta-spark==4.4.1      (matches Spark 4.2)
+import os, re, shutil
+from delta import configure_spark_with_delta_pip
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession, functions as F
 
-for d in ["data/stream"]:
-    shutil.rmtree(d, ignore_errors=True)
-os.makedirs("data/stream/in")
+builder = (SparkSession.builder.appName("delta-notes")
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog"))
+spark = configure_spark_with_delta_pip(builder).getOrCreate()
 
-def drop_file(name, events):
-    """Simulate an upstream system writing one new JSON-lines file into the folder."""
-    tmp = f"data/stream/{name}.tmp"
-    with open(tmp, "w") as f:
-        for e in events:
-            f.write(json.dumps(e) + "\\n")
-    os.rename(tmp, f"data/stream/in/{name}.json")   # appear atomically
+shutil.rmtree("data/delta", ignore_errors=True)
+customers = spark.createDataFrame([
+    (1, "Amit", "Pune", "2026-01-10"), (2, "Riya", "Mumbai", "2026-01-12"),
+    (3, "Arjun", "Delhi", "2026-01-15"),
+], "customer_id INT, name STRING, city STRING, updated_at STRING") \\
+    .withColumn("updated_at", F.to_date("updated_at"))'''
+SETUP_EXPL = '''**Delta Lake** is an open table format: ordinary Parquet files plus a **transaction log** (`_delta_log/`) that records every change. The two `config` lines register Delta's SQL commands and catalog; `configure_spark_with_delta_pip` adds the matching Delta JARs to the session.
 
-drop_file("batch1", [
-    {"order_id": 1, "ts": "2026-03-01 10:00:05", "city": "Pune",   "amount": 500},
-    {"order_id": 2, "ts": "2026-03-01 10:03:40", "city": "Delhi",  "amount": 1200},
-    {"order_id": 3, "ts": "2026-03-01 10:07:10", "city": "Pune",   "amount": 300},
-    {"order_id": 4, "ts": "2026-03-01 10:12:00", "city": "Mumbai", "amount": 900},
-])
-
-schema = "order_id INT, ts TIMESTAMP, city STRING, amount INT"'''
-SETUP_EXPL = '''Structured Streaming treats a stream as a **table that keeps growing**: every new record is a new row, and your query is re-run incrementally on the new rows only.
-
-Here the stream source is a folder: each new JSON file is a new batch of orders. `drop_file` writes to a temporary name and renames it, because a file source must never see half-written files. The same code works with Kafka by changing only the `readStream` source.'''
+Databricks has Delta built in; on plain Spark you add the `delta-spark` package whose version matches your Spark version.'''
 
 SECTIONS = [
-    dict(t='12.1 Read a stream: readStream with a schema',
-         code='''orders = spark.readStream.schema(schema).json("data/stream/in")
+    dict(divider=True, t='The medallion architecture in full',
+         lead='Chapters 3, 4 and 5 each built one layer with plain Parquet. Here are the rules for all three, and why Delta is the format teams use for them.'),
 
-print(orders.isStreaming)
-orders.printSchema()''',
-         expl='''`spark.readStream` returns a **streaming DataFrame**. Most of the DataFrame API — `select`, `filter`, `withColumn`, `groupBy`, joins — works on it unchanged.
+    dict(t='12.1 Bronze, Silver, Gold — the rules of each layer',
+         md='''| | **Bronze** | **Silver** | **Gold** |
+|---|---|---|---|
+| Purpose | Keep the data exactly as it arrived | Clean, conformed, trustworthy records | Answers to business questions |
+| Typical content | Raw rows as strings + `_source_file`, `_ingest_date` | Typed columns, deduplicated, validated, one row per key | Aggregates, KPIs, wide tables for BI and ML features |
+| Write pattern | Append only | MERGE (upsert) by key, SCD2 for history | Overwrite or MERGE per period |
+| Data quality | None — never reject | Rules enforced, bad rows quarantined | Business rules, reconciled totals |
+| Who reads it | Data engineers (replay, debugging) | Engineers, analysts, data scientists | Dashboards, reports, models, APIs |
+| Built in | Chapter 3 | Chapter 4 | Chapter 5 |''',
+         expl='''Data flows one way: Bronze → Silver → Gold. Because Bronze keeps everything, a bug in a Silver rule is fixed by changing the rule and **re-running from Bronze** — no source system has to re-send anything.'''),
 
-A file stream **requires** a schema: Spark cannot infer one from data that has not arrived yet. Calling `show()` or `count()` directly on a streaming DataFrame is an error — results are produced by starting a query with `writeStream`.'''),
+    dict(t='12.2 Why plain Parquet folders are not enough',
+         md='''| Problem with a Parquet folder | What Delta's transaction log adds |
+|---|---|
+| A job dies half-way through an overwrite: the old data is gone, the new data is incomplete | **ACID transactions**: a write commits fully or not at all |
+| Correcting one customer means rewriting files by hand | `MERGE`, `UPDATE`, `DELETE` |
+| A bad load cannot be undone | **Time travel** and `RESTORE` to an earlier version |
+| Readers see files appear one by one during a write | Readers always see the last committed version |
+| A new column or wrong type silently enters the table | **Schema enforcement**, and evolution only when you ask |
+| Small files pile up after many appends | `OPTIMIZE` compaction, `VACUUM` of old files |''',
+         expl='''Apache Iceberg and Apache Hudi solve the same problems with a similar design; the ideas in this chapter carry over. These notes use Delta because it ships with Databricks and has a pip package for local Spark.'''),
 
-    dict(t='12.2 Start a query: writeStream, a sink, a trigger',
-         code='''big = orders.filter(F.col("amount") >= 500).select("order_id", "city", "amount")
+    dict(divider=True, t='Delta Lake basics'),
 
-q = (big.writeStream
-        .format("memory").queryName("big_orders")     # results go to an in-memory table
-        .outputMode("append")
-        .trigger(availableNow=True)                   # process what is there, then stop
-        .start())
-q.awaitTermination()
+    dict(t='12.3 Write a Delta table and look inside the folder', tables=['customers'],
+         code='''customers.write.format("delta").save("data/delta/customers")
 
-spark.sql("SELECT * FROM big_orders ORDER BY order_id").show()''',
-         expl='''`writeStream` needs a **sink** (`memory` here — for testing only; real sinks are files, Delta tables and Kafka), an **output mode** and a **trigger**.
+for root, dirs, files in sorted(os.walk("data/delta/customers")):
+    for f in sorted(files):
+        if not f.endswith(".crc"):
+            print(re.sub(r"part-(\\d+)-[0-9a-f-]+", r"part-\\1-…", os.path.join(root, f)))''',
+         expl='''`format("delta")` writes normal Parquet data files (one per partition of the DataFrame; the long file IDs are shortened to `…` here) plus `_delta_log/00000000000000000000.json` — **version 0** of the table. Every later write adds a new numbered JSON file listing which data files were added and removed.
 
-`availableNow=True` processes all data available now and stops — perfect for scheduled "incremental batch" jobs and for reproducible notes. Without a trigger the query runs forever, starting a micro-batch as soon as the previous one finishes.'''),
+A reader first reads the log to find out which Parquet files make up the current version; files not in the log are invisible.'''),
 
-    dict(t='12.3 Process only the new files: checkpoints',
-         code='''def run_to_parquet():
-    q = (orders.writeStream.format("parquet")
-            .option("path", "data/stream/out/orders")
-            .option("checkpointLocation", "data/stream/chk/orders")
-            .trigger(availableNow=True).start())
-    q.awaitTermination()
-    return q.lastProgress["numInputRows"]
+    dict(t='12.4 Every write is a version: history and time travel', tables=['customers'],
+         code='''more = spark.createDataFrame([(4, "Sneha", "Pune", "2026-02-01")],
+                             "customer_id INT, name STRING, city STRING, updated_at STRING") \\
+             .withColumn("updated_at", F.to_date("updated_at"))
+more.write.format("delta").mode("append").save("data/delta/customers")
 
-print("run 1 read", run_to_parquet(), "rows")
-drop_file("batch2", [{"order_id": 5, "ts": "2026-03-01 10:31:00", "city": "Delhi", "amount": 700}])
-print("run 2 read", run_to_parquet(), "rows")
-print("run 3 read", run_to_parquet(), "rows")
-print("table now has", spark.read.parquet("data/stream/out/orders").count(), "rows")''',
-         expl='''The **checkpoint** folder records which files were already processed (and, for stateful queries, the running state). Run 1 reads the 4 orders of batch1. Run 2 reads **only** the new file. Run 3 finds nothing new.
+dt = DeltaTable.forPath(spark, "data/delta/customers")
+dt.history().select("version", "operation", "operationMetrics.numOutputRows").show()
 
-That is how a scheduled streaming job gets **exactly-once** results: restart it as often as you like, and each input file is processed once. Never share a checkpoint between two queries.'''),
+print("now:", spark.read.format("delta").load("data/delta/customers").count(), "rows")
+print("v0: ", spark.read.format("delta").option("versionAsOf", 0).load("data/delta/customers").count(), "rows")''',
+         expl='''`DeltaTable.history()` (SQL: `DESCRIBE HISTORY`) lists every commit: version, operation, and metrics such as rows written. `option("versionAsOf", n)` — or `timestampAsOf` — reads the table **as it was** at that version.
 
-    dict(t='12.4 A running aggregate: outputMode("complete")',
-         code='''per_city = orders.groupBy("city").agg(F.count("*").alias("orders"), F.sum("amount").alias("revenue"))
+Time travel is how you audit a change, reproduce last week's report exactly, or compare before and after a load.'''),
 
-q = (per_city.writeStream.format("memory").queryName("city_totals")
-        .outputMode("complete").trigger(availableNow=True).start())
-q.awaitTermination()
-spark.sql("SELECT * FROM city_totals ORDER BY city").show()''',
-         expl='''An aggregation keeps **state** — the running count and sum per city — between micro-batches. `complete` mode rewrites the whole result table after each batch.
+    dict(t='12.5 Schema enforcement: unexpected columns are refused', error=True,
+         code='''with_email = spark.createDataFrame([(5, "Karan", "Delhi", None, "karan@mail.com")],
+    "customer_id INT, name STRING, city STRING, updated_at DATE, email STRING")
 
-`append` is not allowed for an aggregation without a watermark, because a city's total can still change when new orders arrive; Spark would refuse to start the query.'''),
+with_email.write.format("delta").mode("append").save("data/delta/customers")''',
+         expl='''Plain Parquet would happily write files with an extra column and leave the folder inconsistent. Delta checks the incoming schema against the table's and **refuses** the write: `DELTA_METADATA_MISMATCH`.
 
-    dict(t='12.5 Count per 10-minute window (event time)',
-         code='''windowed = (orders
-    .groupBy(F.window("ts", "10 minutes"), "city")
-    .agg(F.count("*").alias("orders")))
+That protects every Silver and Gold table from an upstream change nobody announced.'''),
 
-q = (windowed.writeStream.format("memory").queryName("per_window")
-        .outputMode("complete").trigger(availableNow=True).start())
-q.awaitTermination()
-spark.sql("SELECT window.start, window.end, city, orders FROM per_window ORDER BY start, city").show()''',
-         expl='''`F.window(timeColumn, "10 minutes")` assigns each order to a 10-minute bucket by its **event time** — the `ts` inside the record — not by when Spark happened to read it. That keeps results correct when data arrives late or out of order.
+    dict(t='12.6 Schema evolution, when you decide to allow it',
+         code='''(with_email.write.format("delta").mode("append")
+           .option("mergeSchema", "true")
+           .save("data/delta/customers"))
 
-`window("ts", "10 minutes", "5 minutes")` would make **sliding** windows that overlap.'''),
+spark.read.format("delta").load("data/delta/customers").orderBy("customer_id").show()''',
+         expl='''`mergeSchema=true` adds the new column to the table schema in the same commit. Existing rows read it as NULL. Evolution is a deliberate, recorded decision — visible in the history — not an accident.'''),
 
-    dict(t='12.6 Late data and watermarks',
-         code='''late_orders = spark.readStream.schema(schema).json("data/stream/in")
-wm = (late_orders.withWatermark("ts", "10 minutes")
-        .groupBy(F.window("ts", "10 minutes")).agg(F.count("*").alias("orders")))
+    dict(t='12.7 UPDATE and DELETE on a lake table',
+         code='''dt = DeltaTable.forPath(spark, "data/delta/customers")
+dt.update(condition="customer_id = 2", set={"city": "'Pune'"})
+dt.delete("customer_id = 5")
 
-def run_wm():
-    q = (wm.writeStream.format("parquet")
-           .option("path", "data/stream/out/wm").option("checkpointLocation", "data/stream/chk/wm")
-           .outputMode("append").trigger(availableNow=True).start())
-    q.awaitTermination()
-    return q.lastProgress["eventTime"].get("watermark")
+spark.read.format("delta").load("data/delta/customers").orderBy("customer_id").show()
+dt.history().select("version", "operation").show()''',
+         expl='''`update(condition, set)` and `delete(condition)` change individual rows. Behind the scenes Delta rewrites only the data files that contain matching rows and commits "remove old file, add new file" to the log. The values in `set` are SQL expressions, so a string needs inner quotes: `"'Pune'"`.'''),
 
-print("watermark after run 1:", run_wm())
-drop_file("batch3", [{"order_id": 6, "ts": "2026-03-01 10:02:00", "city": "Pune", "amount": 450},   # 30 min late
-                     {"order_id": 7, "ts": "2026-03-01 10:45:00", "city": "Pune", "amount": 650}])
-print("watermark after run 2:", run_wm())
-spark.read.parquet("data/stream/out/wm").orderBy("window").show(truncate=False)''',
-         expl='''A **watermark** of 10 minutes says: "events more than 10 minutes older than the latest event seen can be ignored". After batch2 the latest event is 10:31, so the watermark is 10:21 — windows ending before it are **final**, written once in `append` mode, and their state is dropped.
+    dict(divider=True, t='MERGE: the upsert behind every Silver table'),
 
-Order 6 (10:02) arrives after its window was finalised, so it is **not counted**: the 10:00–10:10 window still shows 3 orders. Without a watermark, Spark would have to keep every window's state forever.'''),
+    dict(t='12.8 Upsert a batch of changes (MERGE)',
+         code='''changes = spark.createDataFrame([
+    (1, "Amit", "Bengaluru", "2026-03-01"),    # existing customer, new city
+    (6, "Meera", "Chennai",  "2026-03-01"),    # new customer
+], "customer_id INT, name STRING, city STRING, updated_at STRING") \\
+    .withColumn("updated_at", F.to_date("updated_at"))
 
-    dict(t='12.7 Write each micro-batch with batch code: foreachBatch',
-         code='''def save_batch(batch_df, batch_id):
-    print(f"batch {batch_id}: {batch_df.count()} rows")
-    (batch_df.withColumn("batch_id", F.lit(batch_id))
-             .write.mode("append").parquet("data/stream/out/by_batch"))
+(dt.alias("t")
+   .merge(changes.alias("s"), "t.customer_id = s.customer_id")
+   .whenMatchedUpdate(set={"city": "s.city", "updated_at": "s.updated_at"})
+   .whenNotMatchedInsert(values={"customer_id": "s.customer_id", "name": "s.name",
+                                 "city": "s.city", "updated_at": "s.updated_at"})
+   .execute())
 
-one_file_each = (spark.readStream.schema(schema)
-                      .option("maxFilesPerTrigger", 1)        # a source option
-                      .json("data/stream/in"))
+spark.read.format("delta").load("data/delta/customers").orderBy("customer_id").show()''',
+         expl='''`MERGE` compares source rows with target rows on a key: **matched** rows are updated, **not matched** rows are inserted — one atomic commit. Amit moved to Bengaluru; Meera is new.
 
-q = (one_file_each.writeStream.foreachBatch(save_batch)
-        .option("checkpointLocation", "data/stream/chk/by_batch")
-        .trigger(availableNow=True).start())
-q.awaitTermination()''',
-         expl='''`foreachBatch(func)` calls your function with each micro-batch as an ordinary **batch DataFrame** plus its batch ID. Inside, you can use any batch API: write to several sinks, MERGE into a Delta table, call an API, write to a JDBC database.
+`whenMatchedUpdateAll()` / `whenNotMatchedInsertAll()` copy every column when the names match; `whenNotMatchedBySourceDelete()` also removes target rows missing from the source.'''),
 
-`maxFilesPerTrigger=1` — an option of the **source**, set on `readStream` — makes each file its own micro-batch, so the three files produced three batches (4, 1 and 2 orders). `availableNow` respects such limits and simply runs as many batches as needed. Use `batch_id` to make writes idempotent if a batch is retried.'''),
+    dict(t='12.9 The same MERGE in SQL',
+         code='''spark.sql(f"CREATE TABLE IF NOT EXISTS customers USING DELTA "
+          f"LOCATION '{os.path.abspath('data/delta/customers')}'")
 
-    dict(t='12.8 Enrich a stream with a static table (stream–static join)',
-         code='''cities = spark.createDataFrame([("Pune", "West"), ("Mumbai", "West"), ("Delhi", "North")],
-                               "city STRING, region STRING")
+spark.sql("""
+    MERGE INTO customers AS t
+    USING (SELECT 3 AS customer_id, 'Arjun' AS name, 'Noida' AS city,
+                  DATE'2026-03-05' AS updated_at) AS s
+    ON t.customer_id = s.customer_id
+    WHEN MATCHED AND s.updated_at > t.updated_at
+        THEN UPDATE SET t.city = s.city, t.updated_at = s.updated_at
+    WHEN NOT MATCHED
+        THEN INSERT (customer_id, name, city, updated_at)
+             VALUES (s.customer_id, s.name, s.city, s.updated_at)
+""").show()
 
-enriched = orders.join(cities, "city", "left")
-q = (enriched.writeStream.format("memory").queryName("enriched")
-        .outputMode("append").trigger(availableNow=True).start())
-q.awaitTermination()
-spark.sql("SELECT order_id, city, region, amount FROM enriched ORDER BY order_id").show()''',
-         expl='''Joining a stream with a **static** DataFrame needs no state: each new order is looked up in the static table. The static side is re-read for every micro-batch, so updates to a dimension file are picked up.
+spark.table("customers").filter("customer_id = 3").show()''',
+         expl='''`CREATE TABLE … USING DELTA LOCATION` registers the existing folder under a name in the catalog — no data is copied — so SQL can say `MERGE INTO customers`. The extra condition `s.updated_at > t.updated_at` makes the merge ignore **stale** updates that arrive late — a common guard in real pipelines.
 
-Stream–stream joins are also supported but need watermarks on both sides to bound the state.'''),
+The columns are listed explicitly: `UPDATE SET *` / `INSERT *` would require the source to have **every** target column, including the `email` added on slide 12.6. The statement returns the merge metrics: rows affected, updated, deleted and inserted.'''),
 
-    dict(t='12.9 Monitor a query: status and progress',
-         code='''q = (orders.writeStream.format("memory").queryName("monitor")
-        .trigger(availableNow=True).start())
-q.awaitTermination()
+    dict(t='12.10 SCD Type 1 vs Type 2',
+         md='''| | **SCD Type 1** | **SCD Type 2** |
+|---|---|---|
+| On change | Overwrite the old value | Close the old row, add a new row |
+| History | Lost | Kept, with validity dates |
+| Columns added | None | `start_date`, `end_date`, `is_current` |
+| Question it can answer | "Where does Amit live now?" | "Where did Amit live when he placed the January order?" |
+| Implemented by | The MERGE on slide 12.8 | The MERGE on the next slide |''',
+         expl='''SCD = **slowly changing dimension**: attributes such as a customer's city that change rarely, but whose history matters for correct reporting. Revenue by city for January must use the city the customer had **in January**.'''),
 
-p = q.lastProgress
-print({k: p[k] for k in ["batchId", "numInputRows", "name"]})
-print(p["sources"][0]["description"])
-print(q.status["message"], "| active:", q.isActive)''',
-         expl='''`lastProgress` (and `recentProgress`) report every micro-batch: rows read, input and processing rates, durations, watermark and state size. `status` says what the query is doing right now.
+    dict(t='12.11 SCD Type 2 with one MERGE',
+         code='''dim_customer = (spark.read.format("delta").load("data/delta/customers")
+    .filter("customer_id <= 3")
+    .select("customer_id", "name", "city",
+            F.to_date(F.lit("2026-01-01")).alias("start_date"),
+            F.lit(None).cast("date").alias("end_date"),
+            F.lit(True).alias("is_current")))
+dim_customer.write.format("delta").save("data/delta/dim_customer")
+dim = DeltaTable.forPath(spark, "data/delta/dim_customer")
 
-In production these numbers go to monitoring, and the Spark UI has a **Structured Streaming** tab with the same metrics as charts.'''),
+updates = spark.createDataFrame([(1, "Amit", "Hyderabad", "2026-04-01"), (2, "Riya", "Pune", "2026-04-01"),
+                                 (7, "Dev", "Jaipur", "2026-04-01")],
+                                "customer_id INT, name STRING, city STRING, eff STRING") \\
+    .withColumn("eff", F.to_date("eff"))
+
+current = dim.toDF().filter("is_current")
+changed = updates.alias("u").join(current.alias("c"), "customer_id").filter("u.city <> c.city").select("u.*")
+staged = (changed.withColumn("merge_key", F.lit(None).cast("int"))          # rows to INSERT as new versions
+          .unionByName(updates.withColumn("merge_key", F.col("customer_id"))))  # rows to match and close
+
+(dim.alias("t").merge(staged.alias("s"), "t.customer_id = s.merge_key AND t.is_current")
+    .whenMatchedUpdate(condition="t.city <> s.city", set={"is_current": "false", "end_date": "s.eff"})
+    .whenNotMatchedInsert(values={"customer_id": "s.customer_id", "name": "s.name", "city": "s.city",
+                                  "start_date": "s.eff", "end_date": "null", "is_current": "true"})
+    .execute())
+
+dim.toDF().orderBy("customer_id", "start_date").show()''',
+         expl='''The trick is the **staged** source. Every update appears once with `merge_key = customer_id`: it matches the customer's current row, and if the city changed, that row is **closed** (`is_current = false`, `end_date` set). Changed customers appear a second time with `merge_key = NULL`, which never matches, so they are **inserted** as the new current version.
+
+Result: Amit has a closed Bengaluru row (his city after slide 12.8) and a current Hyderabad row; Riya (already Pune) is untouched; Dev is new. Arjun was not in the batch and keeps his row.'''),
+
+    dict(divider=True, t='Incremental loads'),
+
+    dict(t='12.12 Load only what changed since last time (a high-water mark)',
+         code='''source = spark.createDataFrame([
+    (101, 1, 1500.0, "2026-03-01 09:00:00"), (102, 2,  900.0, "2026-03-01 10:00:00"),
+    (103, 1,  300.0, "2026-03-02 11:00:00"),
+], "order_id INT, customer_id INT, amount DOUBLE, updated_at STRING") \\
+    .withColumn("updated_at", F.to_timestamp("updated_at"))
+
+def incremental_load(src):
+    path = "data/delta/silver_orders"
+    if not DeltaTable.isDeltaTable(spark, path):
+        src.write.format("delta").save(path)                       # first run: full load
+        return src.count()
+    hwm = spark.read.format("delta").load(path).agg(F.max("updated_at")).first()[0]
+    new = src.filter(F.col("updated_at") > F.lit(hwm))            # only rows after the high-water mark
+    (DeltaTable.forPath(spark, path).alias("t")
+        .merge(new.alias("s"), "t.order_id = s.order_id")
+        .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
+    return new.count()
+
+print("run 1 loaded", incremental_load(source))
+source2 = source.unionByName(spark.createDataFrame(
+    [(102, 2, 950.0, "2026-03-03 08:00:00"), (104, 3, 700.0, "2026-03-03 09:00:00")],
+    "order_id INT, customer_id INT, amount DOUBLE, updated_at STRING")
+    .withColumn("updated_at", F.to_timestamp("updated_at")))
+print("run 2 loaded", incremental_load(source2))
+print("run 3 loaded", incremental_load(source2))
+spark.read.format("delta").load("data/delta/silver_orders").orderBy("order_id").show()''',
+         expl='''A **high-water mark** is the largest `updated_at` already loaded. Each run reads only source rows newer than it and **MERGEs** them, so a changed order (102, corrected to 950) is updated in place and a new order (104) is inserted. Run 3 finds nothing new and changes nothing — the load is **idempotent**.
+
+For files instead of a database, Structured Streaming with `availableNow` (Chapter 13) gives the same "only new data" behaviour through checkpoints.'''),
+
+    dict(t='12.13 Pass changes downstream: the Change Data Feed',
+         code='''spark.sql(f"CREATE TABLE IF NOT EXISTS silver_orders USING DELTA "
+          f"LOCATION '{os.path.abspath('data/delta/silver_orders')}'")
+spark.sql("ALTER TABLE silver_orders SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+start = DeltaTable.forPath(spark, "data/delta/silver_orders").history(1).first()["version"] + 1
+
+DeltaTable.forPath(spark, "data/delta/silver_orders").update(
+    condition="order_id = 101", set={"amount": "1600.0"})
+
+(spark.read.format("delta").option("readChangeFeed", "true").option("startingVersion", start)
+      .load("data/delta/silver_orders")
+      .select("order_id", "amount", "_change_type", "_commit_version").show())''',
+         expl='''With the **Change Data Feed** on, Delta records row-level changes. Reading with `readChangeFeed` returns each changed row with `_change_type`: `insert`, `delete`, or the `update_preimage` / `update_postimage` pair (before and after).
+
+Gold jobs use it to update only the aggregates affected by changed Silver rows instead of recomputing everything.'''),
+
+    dict(divider=True, t='Undo and maintenance'),
+
+    dict(t='12.14 Undo a bad load: RESTORE',
+         code='''orders_dt = DeltaTable.forPath(spark, "data/delta/silver_orders")
+good_version = orders_dt.history(1).first()["version"]
+
+orders_dt.delete("amount > 0")                              # oops: deletes everything
+print("after the mistake:", spark.read.format("delta").load("data/delta/silver_orders").count(), "rows")
+
+orders_dt.restoreToVersion(good_version)
+print("after restore:   ", spark.read.format("delta").load("data/delta/silver_orders").count(), "rows")
+orders_dt.history(3).select("version", "operation").show()''',
+         expl='''`restoreToVersion(n)` (SQL: `RESTORE TABLE … TO VERSION AS OF n`) makes an old version current again. It is itself a new commit, so even the restore can be undone.
+
+The old data files are still there because Delta only marks them as removed in the log; they are physically deleted later by `VACUUM`.'''),
+
+    dict(t='12.15 Compact small files: OPTIMIZE, then VACUUM',
+         code='''for i in range(5):                                         # five tiny appends → many small files
+    spark.range(i * 10, i * 10 + 10).write.format("delta").mode("append").save("data/delta/events")
+
+ev = DeltaTable.forPath(spark, "data/delta/events")
+print("files before:", ev.detail().first()["numFiles"])
+m = ev.optimize().executeCompaction().first()["metrics"]
+print("removed", m["numFilesRemoved"], "added", m["numFilesAdded"])
+print("files after: ", ev.detail().first()["numFiles"])''',
+         expl='''Frequent small appends (streaming, hourly loads) create many small files, and reading many small files is slow. `OPTIMIZE` rewrites them into fewer large ones in one commit; readers are not disturbed.
+
+`VACUUM` then deletes data files no longer referenced by any version newer than the retention period (7 days by default). After vacuuming, time travel beyond that period is no longer possible — that is the trade-off.'''),
 ]
 
 POINTS = '''
-1. A stream is an **unbounded table**; Spark runs your query incrementally in **micro-batches**.
-2. `spark.readStream…` → transformations → `writeStream.format(sink).outputMode(mode).trigger(…).start()`.
-3. File streams need an explicit **schema**. Upstream must write files atomically (write, then rename).
-4. **Checkpoints** store progress and state → exactly-once results across restarts. One checkpoint per query.
+1. **Medallion**: Bronze (raw, append-only, lineage) → Silver (clean, typed, MERGE by key) → Gold (business aggregates). Rebuild downstream from Bronze when rules change.
+2. **Delta Lake** = Parquet files + a `_delta_log` transaction log → ACID writes, time travel, MERGE/UPDATE/DELETE, schema enforcement.
+3. Write: `df.write.format("delta").save(path)`; read: `spark.read.format("delta").load(path)`; old versions: `option("versionAsOf", n)`.
+4. Schema changes are refused unless you pass `mergeSchema=true`.
+5. **MERGE** = upsert: `whenMatchedUpdate…`, `whenNotMatchedInsert…`, `whenNotMatchedBySourceDelete`.
 
-    | Output mode | Writes | Allowed with |
+<!--break-->
+
+6. **SCD1** overwrites; **SCD2** closes the old row (`end_date`, `is_current=false`) and inserts a new one — one MERGE with a staged source (`merge_key` NULL for the new versions).
+7. **Incremental loads**: high-water mark on `updated_at` + MERGE → idempotent re-runs. The **Change Data Feed** passes row-level changes downstream.
+8. `RESTORE` undoes a bad load; `OPTIMIZE` compacts small files; `VACUUM` deletes unreferenced files (and limits time travel).
+
+    | Operation | Python | SQL |
     |---|---|---|
-    | `append` | only new final rows | no aggregation, or aggregation + watermark |
-    | `update` | rows that changed in this batch | aggregations |
-    | `complete` | the whole result table | aggregations only |
-
-    | Trigger | Behaviour |
-    |---|---|
-    | default | next micro-batch as soon as the last one ends |
-    | `processingTime="1 minute"` | one micro-batch per minute |
-    | `availableNow=True` | process everything available, then stop |
-
-5. Group by **event time** with `F.window(ts, "10 minutes")`; bound state and late data with `withWatermark(ts, "10 minutes")`.
-6. `foreachBatch` lets you use the full batch API (Delta MERGE, JDBC, several sinks) on each micro-batch.
-7. Monitor with `lastProgress`, `status` and the Structured Streaming tab of the Spark UI.
+    | History | `DeltaTable.forPath(spark, p).history()` | `DESCRIBE HISTORY t` |
+    | Read old version | `.option("versionAsOf", 3)` | `SELECT * FROM t VERSION AS OF 3` |
+    | Upsert | `dt.alias("t").merge(src.alias("s"), cond)…execute()` | `MERGE INTO t USING s ON …` |
+    | Undo | `dt.restoreToVersion(3)` | `RESTORE TABLE t TO VERSION AS OF 3` |
+    | Compact | `dt.optimize().executeCompaction()` | `OPTIMIZE t` |
 '''
 
-EXTRA_TITLE = 'Deep dive: streaming in production'
-EXTRA_LEAD = 'Kafka, the errors you will meet first, and how exactly-once really works.'
-EXTRA = [
-    dict(t='Reading from Kafka', run=False,
-         code='''events = (spark.readStream.format("kafka")
-    .option("kafka.bootstrap.servers", "broker1:9092,broker2:9092")
-    .option("subscribe", "orders")
-    .option("startingOffsets", "latest")
-    .load()
-    .select(F.from_json(F.col("value").cast("string"), schema).alias("o"))
-    .select("o.*"))
-
-(events.writeStream.format("parquet")
-    .option("path", "s3://lake/orders").option("checkpointLocation", "s3://lake/_chk/orders")
-    .trigger(processingTime="1 minute").start())''',
-         expl='''Not run in these notes (it needs a Kafka cluster and the `spark-sql-kafka` package). Kafka delivers `key` and `value` as **bytes**: cast `value` to string and parse it with `from_json` (Chapter 5).
-
-The checkpoint stores the Kafka **offsets** processed; together with an idempotent or transactional sink (file sink, Delta) that gives end-to-end exactly-once.'''),
-    dict(t='Error: a streaming DataFrame cannot show()', error=True,
-         code='''spark.readStream.schema(schema).json("data/stream/in").show()''',
-         expl='''`show`, `count` and `collect` would need the whole, never-ending table. Start a query with `writeStream` instead — to the `memory` sink when you just want to look at results while developing.'''),
-    dict(t='Error: append mode on an aggregation without a watermark', error=True,
-         code='''(spark.readStream.schema(schema).json("data/stream/in")
-      .groupBy("city").count()
-      .writeStream.format("memory").queryName("bad").outputMode("append").start())''',
-         expl='''In `append` mode a row may be written only once, when it is final. A per-city count is never final in an endless stream, so Spark refuses at start-up. Use `complete` or `update`, or aggregate by event-time window with a watermark.'''),
-]
-
 MCQS = [
-    dict(q='What does the checkpoint location of a streaming query store?', kind='concept',
-         o=['A copy of all input data', 'The progress (offsets / processed files) and the state of aggregations', 'The Spark UI logs', 'Only the schema'], a=1,
-         why='Checkpoints record which input was processed and the operator state, so a restarted query continues exactly where it stopped.'),
-    dict(q='Which output mode is **not** allowed for `groupBy("city").count()` on a stream without a watermark?', kind='concept',
-         o=['complete', 'update', 'append', 'All are allowed'], a=2,
-         why='append writes each row once when final; an unbounded per-city count is never final.'),
-    dict(q='A 10-minute watermark is set and the latest event seen is 12:30. An event stamped 12:05 arrives. What happens to it in a 10-minute windowed count?', kind='concept',
-         o=['It is counted in the 12:00–12:10 window', 'It is dropped because its window ended before the watermark (12:20)', 'The query fails', 'It is counted in the 12:30 window'], a=1,
-         why='Watermark = 12:30 − 10 min = 12:20. The 12:00–12:10 window is already finalised, so the late event is ignored.'),
-    dict(q='What does `trigger(availableNow=True)` do?', kind='concept',
-         o=['Runs one micro-batch every second', 'Processes all currently available data (possibly in several batches), then stops', 'Runs forever with minimal latency', 'Reads only the newest file'], a=1,
-         why='availableNow is designed for scheduled incremental jobs: catch up, then stop.'),
-    dict(q='Why must a producer write a file under a temporary name and then rename it into the watched folder?', kind='concept',
-         o=['Spark only reads files ending in .tmp', 'So the stream never reads a half-written file', 'Renaming compresses the file', 'It is required by JSON'], a=1,
-         why='A rename is atomic: the file appears complete or not at all.'),
-    dict(q='The code below raises an error. Why?', kind='debug',
-         code='''stream = spark.readStream.json("data/stream/in")''',
-         o=['json is not a streaming format', 'File streams need an explicit schema', 'The folder must be on HDFS', 'readStream needs .load()'], a=1,
-         why='Spark cannot infer a schema from data that has not arrived yet; pass .schema(...).'),
-    dict(q='Which API lets you MERGE each micro-batch into a Delta table or write it to a JDBC database?', kind='concept',
-         o=['`foreach`', '`foreachBatch`', '`mapInPandas`', '`writeStream.format("jdbc")`'], a=1,
-         why='foreachBatch gives you each micro-batch as a normal DataFrame, so any batch writer works.'),
+    dict(q='What makes a Delta table different from a plain folder of Parquet files?', kind='concept',
+         o=['Delta uses CSV files', 'A transaction log (_delta_log) that records every commit', 'Delta stores data in memory only', 'Delta does not support partitions'], a=1,
+         why='The log turns a folder of Parquet files into a table with ACID commits, versions and row-level operations.'),
+    dict(q='In which layer should a cleaning rule (trim names, cast types, drop invalid phones) be applied?', kind='concept',
+         o=['Bronze', 'Silver', 'Gold', 'In the dashboard'], a=1,
+         why='Bronze keeps raw data untouched; Silver applies cleaning and validation; Gold aggregates.'),
+    dict(q='A customer moves from Pune to Delhi. With SCD Type 2, what happens to the dimension table?', kind='concept',
+         o=['The city is overwritten', 'The Pune row is closed (end_date, is_current=false) and a new Delhi row is inserted', 'Both rows are deleted', 'Nothing — SCD2 ignores changes'], a=1,
+         why='SCD2 keeps history: the old version is closed and a new current version is added.'),
+    dict(q='An append with an extra column fails with a schema mismatch. What allows it deliberately?', kind='debug',
+         code='''df.write.format("delta").mode("append").save(path)''',
+         o=['`.mode("overwrite")`', '`.option("mergeSchema", "true")`', '`.option("inferSchema", "true")`', 'Cast the column to string'], a=1,
+         why='mergeSchema adds new columns to the table schema in the same commit.'),
+    dict(q='What does this print?', kind='output', run=True, check='2',
+         code='''spark.range(3).write.format("delta").mode("overwrite").save("data/delta/q1")
+spark.range(5).write.format("delta").mode("overwrite").save("data/delta/q1")
+print(DeltaTable.forPath(spark, "data/delta/q1").history().count())''',
+         o=['1', '2', '3', '5'], a=1,
+         why='Each write is one commit: two overwrites → versions 0 and 1 → two history rows.'),
+    dict(q='Why does an incremental load with a high-water mark plus MERGE make re-runs safe?', kind='concept',
+         o=['It deletes the target first', 'Rows already loaded are either skipped (older than the mark) or matched and updated, never duplicated', 'It uses append mode', 'It caches the source'], a=1,
+         why='Filtering by the mark and upserting by key means running twice gives the same table as running once.'),
+    dict(q='Someone ran a DELETE without a WHERE on a Delta table an hour ago. What is the fastest fix?', kind='concept',
+         o=['Reload everything from the source systems', '`RESTORE` the table to the version before the delete', 'Run VACUUM', 'Nothing can be done'], a=1,
+         why='Old data files are still referenced by earlier versions; RESTORE makes that version current again (until VACUUM removes them).'),
+    dict(q='What is the trade-off of running `VACUUM` with a short retention?', kind='concept',
+         o=['Queries become slower', 'You can no longer time-travel to versions whose files were deleted', 'The table schema is reset', 'MERGE stops working'], a=1,
+         why='VACUUM physically deletes unreferenced files, so older versions can no longer be read.'),
 ]
 
 PRACTICE = dict(
-    kinds=['Re-create this chapter with your own folder of JSON files; add files one by one and re-run with availableNow.',
-           'Windowed counts with a watermark — predict which late events are dropped, then check.',
-           'A foreachBatch sink that writes to Parquet and also prints per-batch row counts.',
-           'If you can run Docker: start a single Kafka broker and replace the file source with the Kafka source.'],
-    note='Streaming is learned by watching state change across runs; there is no LeetCode equivalent.')
+    kinds=['Convert your Chapter 3–5 Bronze, Silver and Gold Parquet folders into Delta tables.',
+           'Write the Silver step as a MERGE by key, run it twice with the same input, and prove nothing changes.',
+           'Implement SCD2 for a product dimension whose price changes; query the price on a given date.',
+           'Break a table with a bad DELETE, then RESTORE it, and read the history.'],
+    note='Delta also runs on Databricks Free Edition, where these commands work without any setup.')
